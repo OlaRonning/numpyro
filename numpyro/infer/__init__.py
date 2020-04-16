@@ -28,5 +28,6 @@ __all__ = [
     'NUTS',
     'Predictive',
     'SA',
+    'NMC',
     'SVI',
 ]
