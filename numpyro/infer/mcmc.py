@@ -10,6 +10,7 @@ import os
 import warnings
 
 from jax import jit, lax, partial, pmap, random, vmap, device_get, device_put
+from jax import jacfwd, jacrev
 from jax.core import Tracer
 from jax.dtypes import canonicalize_dtype
 from jax.flatten_util import ravel_pytree
@@ -23,6 +24,8 @@ from jax.tree_util import tree_flatten, tree_map, tree_multimap
 from numpyro.diagnostics import print_summary
 import numpyro.distributions as dist
 from numpyro.distributions.util import categorical_logits, cholesky_update
+from numpyro.distributions.constraints import real, simplex, positive
+
 from numpyro.infer.hmc_util import (
     IntegratorState,
     build_tree,
@@ -190,7 +193,7 @@ def hmc(potential_fn=None, potential_fn_gen=None, kinetic_fn=None, algo='NUTS'):
                     adapt_mass_matrix=True,
                     dense_mass=False,
                     target_accept_prob=0.8,
-                    trajectory_length=2*math.pi,
+                    trajectory_length=2 * math.pi,
                     max_tree_depth=10,
                     find_heuristic_step_size=False,
                     model_args=(),
@@ -366,6 +369,7 @@ class MCMCKernel(ABC):
     Defines the interface for the Markov transition kernel that is
     used for :class:`~numpyro.infer.MCMC` inference.
     """
+
     def postprocess_fn(self, model_args, model_kwargs):
         """
         Function that transforms unconstrained values at sample sites to values
@@ -447,6 +451,7 @@ class HMC(MCMCKernel):
     :param bool find_heuristic_step_size: whether to a heuristic function to adjust the
         step size at the beginning of each adaptation window. Defaults to False.
     """
+
     def __init__(self,
                  model=None,
                  potential_fn=None,
@@ -615,6 +620,7 @@ class NUTS(HMC):
     :param bool find_heuristic_step_size: whether to a heuristic function to adjust the
         step size at the beginning of each adaptation window. Defaults to False.
     """
+
     def __init__(self,
                  model=None,
                  potential_fn=None,
@@ -848,6 +854,7 @@ class SA(MCMCKernel):
     :param callable init_strategy: a per-site initialization function.
         See :ref:`init_strategy` section for available functions.
     """
+
     def __init__(self, model=None, potential_fn=None, adapt_state_size=None,
                  dense_mass=True, init_strategy=init_to_uniform()):
         if not (model is None) ^ (potential_fn is None):
@@ -938,6 +945,219 @@ class SA(MCMCKernel):
         return self._sample_fn(state, model_args, model_kwargs)
 
 
+NMCState = namedtuple('NMCState', ['i', 'j', 'z', 'potential_energy', 'accept_prob',
+                                   'mean_accept_prob', 'support', 'rng_key'])
+"""
+"""
+
+
+def _nmc(potential_fn=None, potential_fn_gen=None):
+    wa_steps = None
+
+    def init_kernel(init_params,
+                    num_warmup,
+                    model_args=(),
+                    model_kwargs=None,
+                    rng_key=PRNGKey(0)):
+        nonlocal wa_steps
+        wa_steps = num_warmup
+        pe_fn = potential_fn
+        if potential_fn_gen:
+            if pe_fn is not None:
+                raise ValueError('Only one of `potential_fn` or `potential_fn_gen` must be provided.')
+            else:
+                kwargs = {} if model_kwargs is None else model_kwargs
+                pe_fn = potential_fn_gen(*model_args, **kwargs)
+
+        # TODO: get support
+
+        z = init_params
+
+        pe = pe_fn(z)
+
+        nmc_state = (0, 0, z, pe, 0., 0., rng_key)
+        return device_put(nmc_state)
+
+    def _get_proposer(support):
+        if support == real:
+            return _normal_estimator
+        if support == real:
+            # TODO: find way to access whether to use cauchy
+            return _cauchy_estimator()
+        elif support == positive:
+            _estimation_rule = _half_space_estimator
+        elif support == simplex:
+            return _simplex_estimator
+        else:
+            raise NotImplementedError
+
+    def _make_pos_definite(m):
+        # TODO: write this
+        return m
+
+    def _normal_estimator(rng_key, xj, jac_pe, hes_pe):
+        ih_pe = np.linalg.inv(hes_pe)
+        mu = xj - ih_pe * jac_pe
+        sigma = _make_pos_definite(-ih_pe)
+        return dist.Normal(loc=mu, scale=sigma).sample(rng_key)
+
+    def _cauchy_estimator(rng_key, xj, jac_pe, hes_pe):
+        inv = np.linalg.inv
+
+        tmp = hes_pe - np.outer(jac_pe, jac_pe)
+        s = np.dot(jac_pe.T, np.dot(inv(hes_pe), jac_pe))
+        b = xj - np.dot(inv(tmp), jac_pe)
+        A = tmp * (s - 1) / (2 - s)
+
+        return dist.continuous.Cauchy(loc=b, scale=A).sample(rng_key)
+
+    def _half_space_estimator(rng_key, xj, jac_pe, hes_pe):
+
+        alpha = 1 - np.dot(xj ** 2, hes_pe ** 2)
+        beta = -np.dot(xj, hes_pe) - jac_pe
+
+        return dist.continuous.Gamma(concentration=alpha, rate=beta).sample(rng_key)
+
+    def _simplex_estimator(x, jac_pe, hes_pe):
+        "TODO: vectorize estimator"
+        pass
+
+    def jac_hes(pe_fn, x):
+        jac_fn = jacfwd(pe_fn)
+        hes_fn = jacrev(jac_fn)
+        return jac_fn(x), hes_fn(x)
+
+    def sample_kernel(nmc_state, model_args=(), model_kwargs=None):
+        pe_fn = potential_fn  # aka negative log density!
+        if potential_fn_gen:
+            pe_fn = potential_fn_gen(*model_args, **model_kwargs)
+        rng_key, rng_key_transition, rng_key_zj = random.split(nmc_state.rng_key, 3)
+        z_old = nmc_state.z
+        j = nmc_state.j
+        pe_old = nmc_state.pe
+        _, unravel_fn = ravel_pytree(z_old)
+        jac_zj, hes_zj = jac_hes(pe_fn, z_old[j])
+        z_new = z_old
+        z_new[j] = + _get_proposer(nmc_state.support)(rng_key_zj, z_new[j], jac_zj, hes_zj)
+
+        pe_new = pe_fn(unravel_fn(z_new))
+        pe_new = np.where(np.isnan(pe_new), np.inf, pe_new)
+
+        accept_prob = np.exp(-pe_new + pe_old)
+
+        transition = random(rng_key_transition, accept_prob)
+        z, pe = cond(transition,
+                     (z_new, pe_new), lambda args: args,
+                     (z_old, pe_old), lambda args: args)
+
+        itr = nmc_state.i + 1
+        n = np.where(nmc_state.i < wa_steps, itr, itr - wa_steps)
+        mean_accept_prob = nmc_state.mean_accept_prob + (accept_prob - nmc_state.mean_accept_prob) / n
+
+        return NMCState(itr, nmc_state.j + 1, z, pe, accept_prob, mean_accept_prob, nmc_state.support, rng_key)
+
+    return init_kernel, sample_kernel
+
+
+class NMC(MCMCKernel):
+    """
+
+    ***References:***
+    1. *Newtonian Monte Carlo: single-site MCMC meets second-order gradient methods* (https://arxiv.org/pdf/2001.05567.pdf)
+
+    """
+
+    def __init__(self,
+                 model=None,
+                 estimation_rule='normal',
+                 step_size=1.0,
+                 target_accept_prob=0.8,  # between 0.3 and 0.7
+                 trajectory_length=2 * math.pi,
+                 ):
+        self._model = model
+        self._step_size = step_size
+        self._target_accept_prob = target_accept_prob
+        self._trajectory_length = trajectory_length
+        self._max_tree_depth = 10
+        # Set on first call to init
+        self._init_fn = None
+        self._postprocess_fn = None
+        self._sample_fn = None
+
+    def _init_state(self, rng_key, model_args, model_kwargs):
+        if self._model is not None:
+            potential_fn_gen, self._postprocess_fn = get_potential_fn(
+                rng_key,
+                self._model,
+                dynamic_args=True,
+                model_args=model_args,
+                model_kwargs=model_kwargs)
+            # NB: init args is different from HMC
+            self._init_fn, self._sample_fn = _nmc(potential_fn_gen=potential_fn_gen)
+        else:
+            self._init_fn, self._sample_fn = _nmc(potential_fn=self._potential_fn)
+
+    @copy_docs_from(MCMCKernel.init)
+    def init(self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs={}):
+        # non-vectorized
+        if rng_key.ndim == 1:
+            rng_key, rng_key_init_model = random.split(rng_key)
+        # vectorized
+        else:
+            rng_key, rng_key_init_model = np.swapaxes(vmap(random.split)(rng_key), 0, 1)
+            # we need only a single key for initializing PE / constraints fn
+            rng_key_init_model = rng_key_init_model[0]
+        if not self._init_fn:
+            self._init_state(rng_key_init_model, model_args, model_kwargs)
+        if self._potential_fn and init_params is None:
+            raise ValueError('Valid value of `init_params` must be provided with'
+                             ' `potential_fn`.')
+        # Find valid initial params
+        if self._model and not init_params:
+            init_params, is_valid = find_valid_initial_params(rng_key, self._model,
+                                                              init_strategy=self._init_strategy,
+                                                              param_as_improper=True,
+                                                              model_args=model_args,
+                                                              model_kwargs=model_kwargs)
+            if not_jax_tracer(is_valid):
+                if device_get(~np.all(is_valid)):
+                    raise RuntimeError("Cannot find valid initial parameters. "
+                                       "Please check your model again.")
+
+        # NB: init args is different from HMC
+        nmc_init_fn = lambda init_params, rng_key: self._init_fn(
+            init_params,
+            rng_key=rng_key,
+            model_args=model_args,
+            model_kwargs=model_kwargs,
+        )
+        if rng_key.ndim == 1:
+            init_state = nmc_init_fn(init_params, rng_key)
+        else:
+            init_state = vmap(nmc_init_fn)(init_params, rng_key)
+            sample_fn = vmap(self._sample_fn, in_axes=(0, None, None))
+            self._sample_fn = sample_fn
+        return init_state
+
+    @copy_docs_from(MCMCKernel.postprocess_fn)
+    def postprocess_fn(self, args, kwargs):
+        if self._postprocess_fn is None:
+            return identity
+        return self._postprocess_fn(*args, **kwargs)
+
+    def sample(self, state, model_args, model_kwargs):
+        """
+        Run NMC from the given :data:`~numpyro.infer.mcmc.NMCState` and return the resulting
+        :data:`~numpyro.infer.mcmc.NMCState`.
+
+        :param NMCState state: Represents the current state.
+        :param model_args: Arguments provided to the model.
+        :param model_kwargs: Keyword arguments provided to the model.
+        :return: Next `state` after running NMC.
+        """
+        return self._sample_fn(state, model_args, model_kwargs)
+
+
 def _get_value_from_index(xs, i):
     return tree_map(lambda x: x[i], xs)
 
@@ -1014,6 +1234,7 @@ class MCMC(object):
         computation as a function of model arguments. As such, calling `MCMC.run` again
         on a same sized but different dataset will not result in additional compilation cost.
     """
+
     def __init__(self,
                  sampler,
                  num_warmup,
@@ -1087,7 +1308,7 @@ class MCMC(object):
                                            model_args=args, model_kwargs=kwargs)
         if self.postprocess_fn is None:
             self.postprocess_fn = self.sampler.postprocess_fn(args, kwargs)
-        diagnostics = lambda x: get_diagnostics_str(x[0]) if rng_key.ndim == 1 else None   # noqa: E731
+        diagnostics = lambda x: get_diagnostics_str(x[0]) if rng_key.ndim == 1 else None  # noqa: E731
         init_val = (init_state, args, kwargs) if self._jit_model_args else (init_state,)
         lower_idx = self._collection_params["lower"]
         upper_idx = self._collection_params["upper"]
