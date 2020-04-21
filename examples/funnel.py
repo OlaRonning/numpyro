@@ -37,7 +37,7 @@ import jax.numpy as np
 import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions.transforms import AffineTransform
-from numpyro.infer import MCMC, NUTS
+from numpyro.infer import MCMC, NUTS, SA, NMC
 
 
 def model(dim=10):
@@ -52,7 +52,7 @@ def reparam_model(dim=10):
 
 
 def run_inference(model, args, rng_key):
-    kernel = NUTS(model)
+    kernel = NMC(model)
     mcmc = MCMC(kernel, args.num_warmup, args.num_samples, num_chains=args.num_chains,
                 progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
     mcmc.run(rng_key)
@@ -73,7 +73,6 @@ def main(args):
 
     # make plots
     fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(8, 8))
-
     ax1.plot(samples['x'][:, 0], samples['y'], "go", alpha=0.3)
     ax1.set(xlim=(-20, 20), ylim=(-9, 9), ylabel='y',
             title='Funnel samples with centered parameterization')
@@ -84,10 +83,18 @@ def main(args):
 
     plt.savefig('funnel_plot.pdf')
     plt.tight_layout()
+    plt.clf()
+    plt.hist(samples['x'][:, 0], bins=300)
+    plt.show()
 
 
 if __name__ == "__main__":
+
     assert numpyro.__version__.startswith('0.2.4')
+    # numpyro.enable_validation()
+    from jax.config import config
+
+    # config.update('jax_disable_jit', True)
     parser = argparse.ArgumentParser(description="Non-centered reparameterization example")
     parser.add_argument("-n", "--num-samples", nargs="?", default=1000, type=int)
     parser.add_argument("--num-warmup", nargs='?', default=1000, type=int)

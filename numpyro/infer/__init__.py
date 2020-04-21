@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from numpyro.infer.elbo import ELBO, RenyiELBO
-from numpyro.infer.mcmc import HMC, MCMC, NUTS, SA
+from numpyro.infer.mcmc import HMC, MCMC, NUTS, SA, NMC
 from numpyro.infer.svi import SVI
 from numpyro.infer.util import (
     Predictive,

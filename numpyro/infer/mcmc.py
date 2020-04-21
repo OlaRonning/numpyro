@@ -8,6 +8,7 @@ import math
 from operator import attrgetter
 import os
 import warnings
+from pprint import pprint
 
 from jax import jit, lax, partial, pmap, random, vmap, device_get, device_put
 from jax import jacfwd, jacrev
@@ -19,12 +20,12 @@ from jax.lib import xla_bridge
 import jax.numpy as np
 from jax.random import PRNGKey
 from jax.scipy.special import logsumexp
-from jax.tree_util import tree_flatten, tree_map, tree_multimap
+from jax.tree_util import tree_flatten, tree_map, tree_multimap, tree_unflatten
 
 from numpyro.diagnostics import print_summary
 import numpyro.distributions as dist
 from numpyro.distributions.util import categorical_logits, cholesky_update
-from numpyro.distributions.constraints import real, simplex, positive
+from numpyro.distributions.constraints import positive_definite
 
 from numpyro.infer.hmc_util import (
     IntegratorState,
@@ -945,14 +946,16 @@ class SA(MCMCKernel):
         return self._sample_fn(state, model_args, model_kwargs)
 
 
-NMCState = namedtuple('NMCState', ['i', 'j', 'z', 'potential_energy', 'accept_prob',
-                                   'mean_accept_prob', 'support', 'rng_key'])
+NMCState = namedtuple('NMCState', ['i', 'z', 'potential_energy', 'accept_prob', 'diverging',
+                                   'mean_accept_prob', 'rng_key'])
 """
 """
 
 
 def _nmc(potential_fn=None, potential_fn_gen=None):
+    # try out more instantiations and find one with a nice gradient
     wa_steps = None
+    max_delta_energy = 1000.
 
     def init_kernel(init_params,
                     num_warmup,
@@ -969,47 +972,53 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
                 kwargs = {} if model_kwargs is None else model_kwargs
                 pe_fn = potential_fn_gen(*model_args, **kwargs)
 
-        # TODO: get support
-
-        z = init_params
-
-        pe = pe_fn(z)
-
-        nmc_state = (0, 0, z, pe, 0., 0., rng_key)
+        nmc_state = NMCState(0, init_params, pe_fn(init_params), 0., False, 0., rng_key)
         return device_put(nmc_state)
 
-    def _get_proposer(support):
-        if support == real:
-            return _normal_estimator
-        if support == real:
-            # TODO: find way to access whether to use cauchy
-            return _cauchy_estimator()
-        elif support == positive:
-            _estimation_rule = _half_space_estimator
-        elif support == simplex:
-            return _simplex_estimator
+    def _get_proposer(estimator):
+        if estimator == 'normal':
+            sampler = _normal_estimator
+        elif estimator == 'cauchy':
+            # TODO: find way to know to use cauchy
+            sampler = _cauchy_estimator()
+        elif estimator == 'half_space':
+            sampler = _half_space_estimator
+        elif estimator == 'simplex':
+            sampler = _simplex_estimator
         else:
-            raise NotImplementedError
+            sampler = None
+        return sampler
 
     def _make_pos_definite(m):
-        # TODO: write this
-        return m
+        eig_vals, eig_vr = map(np.real, np.linalg.eig(m))
+        eig_vals = np.where(eig_vals > 0, eig_vals, 1e-8)
+        re_m = np.dot(np.linalg.inv(eig_vr), np.dot(np.diag(eig_vals), eig_vr))
+        return re_m
 
-    def _normal_estimator(rng_key, xj, jac_pe, hes_pe):
-        ih_pe = np.linalg.inv(hes_pe)
-        mu = xj - ih_pe * jac_pe
-        sigma = _make_pos_definite(-ih_pe)
-        return dist.Normal(loc=mu, scale=sigma).sample(rng_key)
+    def _normal_estimator(rng_key, x, jac_pe, hes_pe):
+        if np.ndim(hes_pe) == 0:
+            variance = 1 / hes_pe
+        else:
+            hes_pe = np.linalg.inv(hes_pe)
+            variance = cond(np.linalg.matrix_rank(hes_pe) != np.shape(hes_pe)[0],
+                           hes_pe, _make_pos_definite,
+                           hes_pe, lambda arg: arg)
+        loc = x - np.dot(variance, jac_pe)
+        if np.ndim(hes_pe) == 0:
+            sample = dist.Normal(loc=loc, scale=variance).sample(rng_key)
+        else:
+            sample = dist.MultivariateNormal(loc=loc, covariance_matrix=variance).sample(rng_key)
+        return sample
 
     def _cauchy_estimator(rng_key, xj, jac_pe, hes_pe):
         inv = np.linalg.inv
 
         tmp = hes_pe - np.outer(jac_pe, jac_pe)
         s = np.dot(jac_pe.T, np.dot(inv(hes_pe), jac_pe))
-        b = xj - np.dot(inv(tmp), jac_pe)
-        A = tmp * (s - 1) / (2 - s)
+        loc = xj - np.dot(inv(tmp), jac_pe)
+        scale = tmp * (s - 1) / (2 - s)
 
-        return dist.continuous.Cauchy(loc=b, scale=A).sample(rng_key)
+        return dist.continuous.Cauchy(loc=loc, scale=scale).sample(rng_key)
 
     def _half_space_estimator(rng_key, xj, jac_pe, hes_pe):
 
@@ -1023,9 +1032,14 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         pass
 
     def jac_hes(pe_fn, x):
+        n = len(x)
         jac_fn = jacfwd(pe_fn)
         hes_fn = jacrev(jac_fn)
-        return jac_fn(x), hes_fn(x)
+        jac = jac_fn(x)
+        tree_def = tree_flatten(jac)[1]
+        hes_leaves = tree_flatten(hes_fn(x))[0][::n + 1]  # remove all d/dxdy f leaves
+        hes = tree_unflatten(tree_def, hes_leaves)
+        return jac, hes
 
     def sample_kernel(nmc_state, model_args=(), model_kwargs=None):
         pe_fn = potential_fn  # aka negative log density!
@@ -1033,28 +1047,35 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
             pe_fn = potential_fn_gen(*model_args, **model_kwargs)
         rng_key, rng_key_transition, rng_key_zj = random.split(nmc_state.rng_key, 3)
         z_old = nmc_state.z
-        j = nmc_state.j
-        pe_old = nmc_state.pe
-        _, unravel_fn = ravel_pytree(z_old)
-        jac_zj, hes_zj = jac_hes(pe_fn, z_old[j])
-        z_new = z_old
-        z_new[j] = + _get_proposer(nmc_state.support)(rng_key_zj, z_new[j], jac_zj, hes_zj)
+        _, tree_def = tree_flatten(z_old)
+        pe_old = nmc_state.potential_energy
 
-        pe_new = pe_fn(unravel_fn(z_new))
+        jac_zj, hes_zj = jac_hes(pe_fn, z_old)  # TODO:  make only j dimension
+        # code like new_jax_array = index_add(jax_array, index[::2, 3:], 7.)
+        estimator = 'normal'  # TODO: lookup estimator
+        z_new = tree_multimap(_get_proposer(estimator),
+                              tree_unflatten(tree_def, random.split(rng_key_zj, len(z_old))),
+                              z_old,
+                              jac_zj,
+                              hes_zj)
+        pe_new = pe_fn(z_new)
+
         pe_new = np.where(np.isnan(pe_new), np.inf, pe_new)
 
-        accept_prob = np.exp(-pe_new + pe_old)
+        delta_pe = pe_new - pe_old
+        accept_prob = np.clip(np.exp(-delta_pe), a_max=1)
 
-        transition = random(rng_key_transition, accept_prob)
+        transition = random.bernoulli(rng_key_transition, accept_prob)
         z, pe = cond(transition,
                      (z_new, pe_new), lambda args: args,
-                     (z_old, pe_old), lambda args: args)
+                     (z_new, pe_new), lambda args: args)
 
         itr = nmc_state.i + 1
         n = np.where(nmc_state.i < wa_steps, itr, itr - wa_steps)
         mean_accept_prob = nmc_state.mean_accept_prob + (accept_prob - nmc_state.mean_accept_prob) / n
 
-        return NMCState(itr, nmc_state.j + 1, z, pe, accept_prob, mean_accept_prob, nmc_state.support, rng_key)
+        diverging = delta_pe > max_delta_energy
+        return NMCState(itr, z, pe, accept_prob, diverging, mean_accept_prob, rng_key)
 
     return init_kernel, sample_kernel
 
@@ -1073,12 +1094,15 @@ class NMC(MCMCKernel):
                  step_size=1.0,
                  target_accept_prob=0.8,  # between 0.3 and 0.7
                  trajectory_length=2 * math.pi,
+                 init_strategy=init_to_uniform()
                  ):
         self._model = model
         self._step_size = step_size
         self._target_accept_prob = target_accept_prob
         self._trajectory_length = trajectory_length
         self._max_tree_depth = 10
+        self._potential_fn = None
+        self._init_strategy = init_strategy
         # Set on first call to init
         self._init_fn = None
         self._postprocess_fn = None
@@ -1130,6 +1154,7 @@ class NMC(MCMCKernel):
             rng_key=rng_key,
             model_args=model_args,
             model_kwargs=model_kwargs,
+            num_warmup=num_warmup,
         )
         if rng_key.ndim == 1:
             init_state = nmc_init_fn(init_params, rng_key)
@@ -1324,6 +1349,7 @@ class MCMC(object):
                                     progbar_desc=functools.partial(get_progbar_desc_str,
                                                                    lower_idx),
                                     diagnostics_fn=diagnostics)
+
         states, last_val = collect_vals
         # Get first argument of type `HMCState`
         last_state = last_val[0]

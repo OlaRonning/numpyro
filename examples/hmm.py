@@ -40,7 +40,7 @@ from jax.scipy.special import logsumexp
 
 import numpyro
 import numpyro.distributions as dist
-from numpyro.infer import MCMC, NUTS
+from numpyro.infer import MCMC, NUTS, NMC, SA
 
 
 def simulate_data(rng_key, num_categories, num_words, num_supervised_data, num_unsupervised_data):
