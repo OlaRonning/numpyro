@@ -91,7 +91,7 @@ def main(args):
 if __name__ == "__main__":
 
     assert numpyro.__version__.startswith('0.2.4')
-    # numpyro.enable_validation()
+    numpyro.enable_validation()
     from jax.config import config
 
     # config.update('jax_disable_jit', True)

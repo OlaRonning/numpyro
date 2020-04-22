@@ -157,7 +157,7 @@ def main(args):
     print('Starting inference...')
     rng_key = random.PRNGKey(2)
     start = time.time()
-    kernel = NUTS(semi_supervised_hmm)
+    kernel = NMC(semi_supervised_hmm)
     mcmc = MCMC(kernel, args.num_warmup, args.num_samples,
                 progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
     mcmc.run(rng_key, transition_prior, emission_prior, supervised_categories,
@@ -187,14 +187,20 @@ if __name__ == '__main__':
     assert numpyro.__version__.startswith('0.2.4')
     parser = argparse.ArgumentParser(description='Semi-supervised Hidden Markov Model')
     parser.add_argument('--num-categories', default=3, type=int)
-    parser.add_argument('--num-words', default=10, type=int)
+    parser.add_argument('--num-words', default=4, type=int)
     parser.add_argument('--num-supervised', default=100, type=int)
     parser.add_argument('--num-unsupervised', default=500, type=int)
-    parser.add_argument('-n', '--num-samples', nargs='?', default=1000, type=int)
-    parser.add_argument('--num-warmup', nargs='?', default=500, type=int)
+    parser.add_argument('-n', '--num-samples', nargs='?', default=500, type=int)
+    parser.add_argument('--num-warmup', nargs='?', default=1500, type=int)
     parser.add_argument("--num-chains", nargs='?', default=1, type=int)
     parser.add_argument('--device', default='cpu', type=str, help='use "cpu" or "gpu".')
+
     args = parser.parse_args()
+
+    # numpyro.enable_validation()
+    from jax.config import config
+
+    #config.update('jax_disable_jit', True)
 
     numpyro.set_platform(args.device)
     numpyro.set_host_device_count(args.num_chains)

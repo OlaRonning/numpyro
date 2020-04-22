@@ -8,7 +8,6 @@ import math
 from operator import attrgetter
 import os
 import warnings
-from pprint import pprint
 
 from jax import jit, lax, partial, pmap, random, vmap, device_get, device_put
 from jax import jacfwd, jacrev
@@ -25,7 +24,6 @@ from jax.tree_util import tree_flatten, tree_map, tree_multimap, tree_unflatten
 from numpyro.diagnostics import print_summary
 import numpyro.distributions as dist
 from numpyro.distributions.util import categorical_logits, cholesky_update
-from numpyro.distributions.constraints import positive_definite
 
 from numpyro.infer.hmc_util import (
     IntegratorState,
@@ -989,31 +987,34 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
             sampler = None
         return sampler
 
-    def _make_pos_definite(m):
+    def pd_inv(m):
         eig_vals, eig_vr = map(np.real, np.linalg.eig(m))
-        eig_vals = np.where(eig_vals > 0, eig_vals, 1e-8)
-        re_m = np.dot(np.linalg.inv(eig_vr), np.dot(np.diag(eig_vals), eig_vr))
+        eig_vals = np.where(eig_vals > 0, eig_vals, 1e8)
+        re_m = np.dot(eig_vr, np.dot(np.diag(np.reciprocal(eig_vals)), np.linalg.inv(eig_vr)))
         return re_m
 
     def _normal_estimator(rng_key, x, jac_pe, hes_pe):
-        if np.ndim(hes_pe) == 0:
+        ndim = np.ndim(x)
+        if ndim == 0:
             variance = 1 / hes_pe
-        else:
-            hes_pe = np.linalg.inv(hes_pe)
-            variance = cond(np.linalg.matrix_rank(hes_pe) != np.shape(hes_pe)[0],
-                           hes_pe, _make_pos_definite,
-                           hes_pe, lambda arg: arg)
-        loc = x - np.dot(variance, jac_pe)
-        if np.ndim(hes_pe) == 0:
+            loc = x - variance * jac_pe
             sample = dist.Normal(loc=loc, scale=variance).sample(rng_key)
-        else:
+        elif ndim == 1:
+            variance = pd_inv(hes_pe)
+            loc = x - variance @ jac_pe
             sample = dist.MultivariateNormal(loc=loc, covariance_matrix=variance).sample(rng_key)
+        elif ndim == 2:
+            n, p = np.shape(x)
+            variance = pd_inv(hes_pe.reshape(n * p, n * p))
+            loc = x.ravel() - variance @ jac_pe.ravel().T
+            sample = dist.MultivariateNormal(loc=loc, covariance_matrix=variance).sample(rng_key).reshape(
+                x.shape)
         return sample
 
     def _cauchy_estimator(rng_key, xj, jac_pe, hes_pe):
         inv = np.linalg.inv
 
-        tmp = hes_pe - np.outer(jac_pe, jac_pe)
+        tmp = hes_pe - np.outer(jac_pe, jac_pe.T)
         s = np.dot(jac_pe.T, np.dot(inv(hes_pe), jac_pe))
         loc = xj - np.dot(inv(tmp), jac_pe)
         scale = tmp * (s - 1) / (2 - s)
@@ -1050,8 +1051,8 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         _, tree_def = tree_flatten(z_old)
         pe_old = nmc_state.potential_energy
 
-        jac_zj, hes_zj = jac_hes(pe_fn, z_old)  # TODO:  make only j dimension
-        # code like new_jax_array = index_add(jax_array, index[::2, 3:], 7.)
+        jac_zj, hes_zj = jac_hes(pe_fn, z_old)
+
         estimator = 'normal'  # TODO: lookup estimator
         z_new = tree_multimap(_get_proposer(estimator),
                               tree_unflatten(tree_def, random.split(rng_key_zj, len(z_old))),
@@ -1068,7 +1069,7 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         transition = random.bernoulli(rng_key_transition, accept_prob)
         z, pe = cond(transition,
                      (z_new, pe_new), lambda args: args,
-                     (z_new, pe_new), lambda args: args)
+                     (z_old, pe_old), lambda args: args)
 
         itr = nmc_state.i + 1
         n = np.where(nmc_state.i < wa_steps, itr, itr - wa_steps)
@@ -1090,7 +1091,6 @@ class NMC(MCMCKernel):
 
     def __init__(self,
                  model=None,
-                 estimation_rule='normal',
                  step_size=1.0,
                  target_accept_prob=0.8,  # between 0.3 and 0.7
                  trajectory_length=2 * math.pi,
@@ -1100,7 +1100,6 @@ class NMC(MCMCKernel):
         self._step_size = step_size
         self._target_accept_prob = target_accept_prob
         self._trajectory_length = trajectory_length
-        self._max_tree_depth = 10
         self._potential_fn = None
         self._init_strategy = init_strategy
         # Set on first call to init
@@ -1349,7 +1348,6 @@ class MCMC(object):
                                     progbar_desc=functools.partial(get_progbar_desc_str,
                                                                    lower_idx),
                                     diagnostics_fn=diagnostics)
-
         states, last_val = collect_vals
         # Get first argument of type `HMCState`
         last_state = last_val[0]

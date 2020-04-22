@@ -12,7 +12,7 @@ import jax.numpy as np
 import numpyro
 import numpyro.distributions as dist
 from numpyro.examples.datasets import COVTYPE, load_dataset
-from numpyro.infer import MCMC, NUTS
+from numpyro.infer import MCMC, NUTS, NMC
 
 
 def _load_dataset():
@@ -47,7 +47,7 @@ def benchmark_hmc(args, features, labels):
     trajectory_length = step_size * args.num_steps
     rng_key = random.PRNGKey(1)
     start = time.time()
-    kernel = NUTS(model, trajectory_length=trajectory_length)
+    kernel = NMC(model, trajectory_length=trajectory_length)
     mcmc = MCMC(kernel, 0, args.num_samples)
     mcmc.run(rng_key, features, labels)
     mcmc.print_summary()
