@@ -107,6 +107,52 @@ class Cauchy(Distribution):
     def variance(self):
         return np.full(self.batch_shape, np.nan)
 
+@copy_docs_from(Distribution)
+class MultivariateCauchy(Distribution):
+    arg_constraints = {'loc': constraints.real_vector,
+                       'scale_matrix': constraints.positive_definite}
+    support = constraints.real
+    reparametrized_params = ['loc', 'scale_matrix']
+
+    def __init__(self, loc=0., scale_matrix=None, scale_tril=None, validate_args=None):
+        if np.isscalar(loc):
+            loc = np.expand_dims(loc, axis=-1)
+        # temporary append a new axis to loc
+        loc = loc[..., np.newaxis]
+        if scale_matrix is not None:
+            loc, self.scale_matrix = promote_shapes(loc, scale_matrix)
+            self.scale_tril = np.linalg.cholesky(self.scale_matrix)
+        elif scale_tril is not None:
+            loc, self.scale_tril = promote_shapes(loc, scale_tril)
+        else:
+            raise ValueError('One of `covariance_matrix`, `scale_tril`'
+                             ' must be specified.')
+        batch_shape = lax.broadcast_shapes(np.shape(loc)[:-2], np.shape(self.scale_tril)[:-2])
+        event_shape = np.shape(self.scale_tril)[-1:]
+        self.loc = np.broadcast_to(np.squeeze(loc, axis=-1), batch_shape + event_shape)
+        super(MultivariateCauchy, self).__init__(batch_shape=batch_shape,
+                                                 event_shape=event_shape,
+                                                 validate_args=validate_args)
+
+    def sample(self, key, sample_shape=()):
+        eps = random.cauchy(key, shape=sample_shape + self.batch_shape + self.event_shape)
+        return self.loc + np.squeeze(np.matmul(self.scale_tril, eps[..., np.newaxis]), axis=-1)
+
+    @validate_sample
+    def log_prob(self, value):
+        k = self.scale_tril.shape[-1]
+        dist = np.log(1 + _batch_mahalanobis(self.scale_tril, value - self.loc))
+        normalize_term = k * .5 * gammaln(.5) - .5 * np.log(np.abs(self.scale_tril))
+        lp = gammaln((k + 1) * .5) - (k + 1) * .5 * dist - (k + 1) * .5 * normalize_term
+        return lp
+
+    @property
+    def mean(self):
+        return np.full(self.batch_shape, np.nan)
+
+    @property
+    def variance(self):
+        return np.full(self.batch_shape, np.nan)
 
 @copy_docs_from(Distribution)
 class Dirichlet(Distribution):

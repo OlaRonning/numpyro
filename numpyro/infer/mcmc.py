@@ -1001,7 +1001,7 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
             sampler = None
         return sampler
 
-    def pd_inv(m):
+    def _pd_inv(m):
         eig_vals, eig_vecr = map(np.real, np.linalg.eig(m))
         ieig_vecr = np.linalg.inv(eig_vecr)
         ieig_vals = np.reciprocal(eig_vals)
@@ -1012,39 +1012,42 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
 
         return inv_m, pd_inv_m
 
-
     def _normal_estimator(rng_key, x, jac_pe, hes_pe):
         ndim = np.ndim(x)
         if ndim == 0:
             variance = 1 / hes_pe
-            loc = x - 2 * variance * jac_pe  # 2 * from derivative of jac
-            dist_ = dist.Normal(loc=loc, scale=variance)
+            ihes_pd = np.where(hes_pe > 0, variance, 1e-8)
+            dist_ = dist.Normal
         elif ndim == 1:
-            ihes_pd, variance = map(lambda m: m, pd_inv(hes_pe))
-            loc = x - 2 * ihes_pd @ jac_pe # 2 * from derivative of jac
-            dist_ = dist.MultivariateNormal(loc=loc, covariance_matrix=variance)
+            ihes_pd, variance = _pd_inv(hes_pe)
+            dist_ = dist.MultivariateNormal
         elif ndim == 2:
             n, p = np.shape(x)
-            ihes_pd, variance = map(lambda m: 2*m, pd_inv(hes_pe.reshape(n * p, n * p)))
-            loc = x.ravel() - ihes_pd @ jac_pe.ravel().T
-            dist_ = dist.MultivariateNormal(loc=loc, covariance_matrix=variance)
-        sample = dist_.sample(rng_key).reshape(x.shape)
-        log_like_x = dist_.log_prob(x.ravel())
+            ihes_pd, variance = _pd_inv(hes_pe.reshape(n * p, n * p))
+            dist_ = dist.MultivariateNormal
+        loc = x.ravel() - 2*np.dot(ihes_pd, jac_pe.ravel().T)  # 2 * from jacobian
+        sample = dist_(loc, variance).sample(rng_key).reshape(x.shape)
         return sample
 
     def _cauchy_estimator(rng_key, x, jac_pe, hes_pe):
         ndim = np.ndim(x)
         if ndim == 0:
             inv = partial(np.divide, 1)
+            dist_ = dist.continuous.Cauchy
         if ndim == 1:
             inv = np.linalg.inv
-
+            dist_ = dist.continuous.MultivariateCauchy
+        if ndim == 2:
+            n, p = np.shape(x)
+            hes_pe = hes_pe.reshape(n * p, n * p)
+            jac_pe = jac_pe.ravel().T
+            dist_ = dist.continuous.MultivariateCauchy
         tmp = -hes_pe - np.outer(jac_pe, jac_pe.T)
         s = np.dot(jac_pe.T, np.dot(inv(hes_pe), jac_pe))
-        loc = x - np.dot(inv(tmp), jac_pe)
+        loc = x.ravel() - np.dot(inv(tmp), jac_pe)
         scale = tmp * (s - 1) / (2 - s)
 
-        return dist.continuous.Cauchy(loc=loc, scale=np.abs(scale)).sample(rng_key)
+        return dist_(loc, scale).sample(rng_key).reshape(x.shape)
 
     def _half_space_estimator(rng_key, xj, jac_pe, hes_pe):
 
@@ -1071,7 +1074,7 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         jac_zj, hes_zj = _jac_hes(pe_fn, z_old)
 
 
-        estimator = 'normal'  # TODO: lookup estimator
+        estimator = 'cauchy'  # TODO: lookup estimator
 
         z_new = tree_multimap(_get_proposer(estimator),   # TODO: flatten this to use vmap
                               tree_unflatten(tree_def, random.split(rng_key_zj, len(z_old) if isinstance(z_old, dict) else 1)),
