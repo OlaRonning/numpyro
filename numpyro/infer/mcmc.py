@@ -946,20 +946,32 @@ class SA(MCMCKernel):
 
 NMCState = namedtuple('NMCState', ['i', 'z', 'potential_energy', 'accept_prob', 'diverging',
                                    'mean_accept_prob', 'rng_key'])
+NMCAdaptState = namedtuple('NMCAdaptState', ['loc', 'variance'])
+# TODO: add adapt state to compute p(z_{+1}|z), p(z|z_{+1})
 """
 """
 
 
 def _nmc(potential_fn=None, potential_fn_gen=None):
-    # try out more instantiations and find one with a nice gradient
     wa_steps = None
     max_delta_energy = 1000.
+
+    def _jac_hes(pe_fn, x):
+        n = len(x) if isinstance(x, dict) else 0
+        jac_fn = jacfwd(pe_fn)
+        hes_fn = jacrev(jac_fn)
+        jac = jac_fn(x)
+        tree_def = tree_flatten(jac)[1]
+        hes_leaves = tree_flatten(hes_fn(x))[0][::n + 1]  # remove all d/dxdy f leaves
+        hes = tree_unflatten(tree_def, hes_leaves)
+        return jac, hes
 
     def init_kernel(init_params,
                     num_warmup,
                     model_args=(),
                     model_kwargs=None,
                     rng_key=PRNGKey(0)):
+
         nonlocal wa_steps
         wa_steps = num_warmup
         pe_fn = potential_fn
@@ -970,6 +982,8 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
                 kwargs = {} if model_kwargs is None else model_kwargs
                 pe_fn = potential_fn_gen(*model_args, **kwargs)
 
+
+
         nmc_state = NMCState(0, init_params, pe_fn(init_params), 0., False, 0., rng_key)
         return device_put(nmc_state)
 
@@ -978,7 +992,7 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
             sampler = _normal_estimator
         elif estimator == 'cauchy':
             # TODO: find way to know to use cauchy
-            sampler = _cauchy_estimator()
+            sampler = _cauchy_estimator
         elif estimator == 'half_space':
             sampler = _half_space_estimator
         elif estimator == 'simplex':
@@ -988,38 +1002,49 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         return sampler
 
     def pd_inv(m):
-        eig_vals, eig_vr = map(np.real, np.linalg.eig(m))
-        eig_vals = np.where(eig_vals > 0, eig_vals, 1e8)
-        re_m = np.dot(eig_vr, np.dot(np.diag(np.reciprocal(eig_vals)), np.linalg.inv(eig_vr)))
-        return re_m
+        eig_vals, eig_vecr = map(np.real, np.linalg.eig(m))
+        ieig_vecr = np.linalg.inv(eig_vecr)
+        ieig_vals = np.reciprocal(eig_vals)
+
+        inv_m = np.dot(eig_vecr, np.dot(np.diag(ieig_vals), ieig_vecr))
+        pd_ieig_vals = np.where(ieig_vals > 0, eig_vals, 1e-8)
+        pd_inv_m = np.dot(eig_vecr, np.dot(np.diag(pd_ieig_vals), ieig_vecr))
+
+        return inv_m, pd_inv_m
+
 
     def _normal_estimator(rng_key, x, jac_pe, hes_pe):
         ndim = np.ndim(x)
         if ndim == 0:
             variance = 1 / hes_pe
-            loc = x - variance * jac_pe
-            sample = dist.Normal(loc=loc, scale=variance).sample(rng_key)
+            loc = x - 2 * variance * jac_pe  # 2 * from derivative of jac
+            dist_ = dist.Normal(loc=loc, scale=variance)
         elif ndim == 1:
-            variance = pd_inv(hes_pe)
-            loc = x - variance @ jac_pe
-            sample = dist.MultivariateNormal(loc=loc, covariance_matrix=variance).sample(rng_key)
+            ihes_pd, variance = map(lambda m: m, pd_inv(hes_pe))
+            loc = x - 2 * ihes_pd @ jac_pe # 2 * from derivative of jac
+            dist_ = dist.MultivariateNormal(loc=loc, covariance_matrix=variance)
         elif ndim == 2:
             n, p = np.shape(x)
-            variance = pd_inv(hes_pe.reshape(n * p, n * p))
-            loc = x.ravel() - variance @ jac_pe.ravel().T
-            sample = dist.MultivariateNormal(loc=loc, covariance_matrix=variance).sample(rng_key).reshape(
-                x.shape)
+            ihes_pd, variance = map(lambda m: 2*m, pd_inv(hes_pe.reshape(n * p, n * p)))
+            loc = x.ravel() - ihes_pd @ jac_pe.ravel().T
+            dist_ = dist.MultivariateNormal(loc=loc, covariance_matrix=variance)
+        sample = dist_.sample(rng_key).reshape(x.shape)
+        log_like_x = dist_.log_prob(x.ravel())
         return sample
 
-    def _cauchy_estimator(rng_key, xj, jac_pe, hes_pe):
-        inv = np.linalg.inv
+    def _cauchy_estimator(rng_key, x, jac_pe, hes_pe):
+        ndim = np.ndim(x)
+        if ndim == 0:
+            inv = partial(np.divide, 1)
+        if ndim == 1:
+            inv = np.linalg.inv
 
-        tmp = hes_pe - np.outer(jac_pe, jac_pe.T)
+        tmp = -hes_pe - np.outer(jac_pe, jac_pe.T)
         s = np.dot(jac_pe.T, np.dot(inv(hes_pe), jac_pe))
-        loc = xj - np.dot(inv(tmp), jac_pe)
+        loc = x - np.dot(inv(tmp), jac_pe)
         scale = tmp * (s - 1) / (2 - s)
 
-        return dist.continuous.Cauchy(loc=loc, scale=scale).sample(rng_key)
+        return dist.continuous.Cauchy(loc=loc, scale=np.abs(scale)).sample(rng_key)
 
     def _half_space_estimator(rng_key, xj, jac_pe, hes_pe):
 
@@ -1032,15 +1057,7 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         "TODO: vectorize estimator"
         pass
 
-    def jac_hes(pe_fn, x):
-        n = len(x)
-        jac_fn = jacfwd(pe_fn)
-        hes_fn = jacrev(jac_fn)
-        jac = jac_fn(x)
-        tree_def = tree_flatten(jac)[1]
-        hes_leaves = tree_flatten(hes_fn(x))[0][::n + 1]  # remove all d/dxdy f leaves
-        hes = tree_unflatten(tree_def, hes_leaves)
-        return jac, hes
+
 
     def sample_kernel(nmc_state, model_args=(), model_kwargs=None):
         pe_fn = potential_fn  # aka negative log density!
@@ -1051,11 +1068,13 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         _, tree_def = tree_flatten(z_old)
         pe_old = nmc_state.potential_energy
 
-        jac_zj, hes_zj = jac_hes(pe_fn, z_old)
+        jac_zj, hes_zj = _jac_hes(pe_fn, z_old)
+
 
         estimator = 'normal'  # TODO: lookup estimator
-        z_new = tree_multimap(_get_proposer(estimator),
-                              tree_unflatten(tree_def, random.split(rng_key_zj, len(z_old))),
+
+        z_new = tree_multimap(_get_proposer(estimator),   # TODO: flatten this to use vmap
+                              tree_unflatten(tree_def, random.split(rng_key_zj, len(z_old) if isinstance(z_old, dict) else 1)),
                               z_old,
                               jac_zj,
                               hes_zj)
@@ -1091,16 +1110,11 @@ class NMC(MCMCKernel):
 
     def __init__(self,
                  model=None,
-                 step_size=1.0,
-                 target_accept_prob=0.8,  # between 0.3 and 0.7
-                 trajectory_length=2 * math.pi,
-                 init_strategy=init_to_uniform()
+                 potential_fn=None,
+                 init_strategy=init_to_uniform(),
                  ):
         self._model = model
-        self._step_size = step_size
-        self._target_accept_prob = target_accept_prob
-        self._trajectory_length = trajectory_length
-        self._potential_fn = None
+        self._potential_fn = potential_fn
         self._init_strategy = init_strategy
         # Set on first call to init
         self._init_fn = None

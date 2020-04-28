@@ -37,7 +37,7 @@ import jax.numpy as np
 import numpyro
 import numpyro.distributions as dist
 from numpyro.distributions.transforms import AffineTransform
-from numpyro.infer import MCMC, NUTS, SA, NMC
+from numpyro.infer import MCMC, NUTS, SA, NMC, HMC
 
 
 def model(dim=10):
@@ -83,9 +83,6 @@ def main(args):
 
     plt.savefig('funnel_plot.pdf')
     plt.tight_layout()
-    plt.clf()
-    plt.hist(samples['x'][:, 0], bins=300)
-    plt.show()
 
 
 if __name__ == "__main__":
@@ -94,10 +91,10 @@ if __name__ == "__main__":
     numpyro.enable_validation()
     from jax.config import config
 
-    # config.update('jax_disable_jit', True)
+    #config.update('jax_disable_jit', True)
     parser = argparse.ArgumentParser(description="Non-centered reparameterization example")
-    parser.add_argument("-n", "--num-samples", nargs="?", default=1000, type=int)
-    parser.add_argument("--num-warmup", nargs='?', default=1000, type=int)
+    parser.add_argument("-n", "--num-samples", nargs="?", default=10000, type=int)
+    parser.add_argument("--num-warmup", nargs='?', default=0, type=int)
     parser.add_argument("--num-chains", nargs='?', default=1, type=int)
     parser.add_argument("--device", default='cpu', type=str, help='use "cpu" or "gpu".')
     args = parser.parse_args()

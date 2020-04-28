@@ -143,6 +143,7 @@ class Dirichlet(Distribution):
         return self.concentration * (con0 - self.concentration) / (con0 ** 2 * (con0 + 1))
 
 
+
 @copy_docs_from(Distribution)
 class Exponential(Distribution):
     reparametrized_params = ['rate']
@@ -171,6 +172,38 @@ class Exponential(Distribution):
 
 @copy_docs_from(Distribution)
 class Gamma(Distribution):
+    arg_constraints = {'concentration': constraints.positive,
+                       'rate': constraints.positive}
+    support = constraints.positive
+    reparametrized_params = ['rate']
+
+    def __init__(self, concentration, rate=1., validate_args=None):
+        self.concentration, self.rate = promote_shapes(concentration, rate)
+        batch_shape = lax.broadcast_shapes(np.shape(concentration), np.shape(rate))
+        super(Gamma, self).__init__(batch_shape=batch_shape,
+                                    validate_args=validate_args)
+
+    def sample(self, key, sample_shape=()):
+        shape = sample_shape + self.batch_shape + self.event_shape
+        return random.gamma(key, self.concentration, shape=shape) / self.rate
+
+    @validate_sample
+    def log_prob(self, value):
+        normalize_term = (gammaln(self.concentration) -
+                          self.concentration * np.log(self.rate))
+        return (self.concentration - 1) * np.log(value) - self.rate * value - normalize_term
+
+    @property
+    def mean(self):
+        return self.concentration / self.rate
+
+    @property
+    def variance(self):
+        return self.concentration / np.power(self.rate, 2)
+
+@copy_docs_from(Distribution)
+class MultiVariateGamma(Distribution):
+    # TODO
     arg_constraints = {'concentration': constraints.positive,
                        'rate': constraints.positive}
     support = constraints.positive
@@ -948,6 +981,7 @@ class StudentT(Distribution):
         var = np.where(self.df > 2, self.scale ** 2 * self.df / (self.df - 2.0), np.inf)
         var = np.where(self.df <= 1, np.nan, var)
         return np.broadcast_to(var, self.batch_shape)
+
 
 
 class _BaseTruncatedCauchy(Distribution):

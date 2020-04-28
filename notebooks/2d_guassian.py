@@ -12,7 +12,7 @@ def model():
 
 def run_inifernce(model, rng_key=random.PRNGKey(0)):
     kernel = NMC(model)
-    mcmc = MCMC(kernel, 400, 500)
+    mcmc = MCMC(kernel, 200, 300)
     mcmc.run(rng_key)
     mcmc.print_summary()
     return mcmc.get_samples()
