@@ -8,6 +8,7 @@ import math
 from operator import attrgetter
 import os
 import warnings
+import pandas as pd
 
 from jax import jit, lax, partial, pmap, random, vmap, device_get, device_put
 from jax import jacfwd, jacrev
@@ -1074,7 +1075,7 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         jac_zj, hes_zj = _jac_hes(pe_fn, z_old)
 
 
-        estimator = 'cauchy'  # TODO: lookup estimator
+        estimator = 'normal'  # TODO: lookup estimator
 
         z_new = tree_multimap(_get_proposer(estimator),   # TODO: flatten this to use vmap
                               tree_unflatten(tree_def, random.split(rng_key_zj, len(z_old) if isinstance(z_old, dict) else 1)),
