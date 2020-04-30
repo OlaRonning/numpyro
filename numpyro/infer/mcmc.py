@@ -1014,7 +1014,7 @@ def _nmc(model):
         ieig_vals = np.reciprocal(eig_vals)
 
         inv_m = np.dot(eig_vecr, np.dot(np.diag(ieig_vals), ieig_vecr))
-        pd_ieig_vals = np.where(-ieig_vals > 0, -eig_vals, 1e-8)
+        pd_ieig_vals = np.where(ieig_vals < 0, -eig_vals, 1e-8)
         pd_inv_m = np.dot(eig_vecr, np.dot(np.diag(pd_ieig_vals), ieig_vecr))
 
         return inv_m, pd_inv_m
@@ -1023,7 +1023,7 @@ def _nmc(model):
         ndim = np.ndim(x)
         if ndim == 0:
             ihes_pe = 1 / hes_pe
-            variance = np.where(ihes_pe > 0, ihes_pe, 1e-8)
+            variance = np.where(ihes_pe < 0, -ihes_pe, 1e-8)
             dist_ = dist.Normal
         elif ndim == 1:
             ihes_pe, variance = _pd_inv(hes_pe)

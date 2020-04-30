@@ -92,7 +92,7 @@ if __name__ == "__main__":
     numpyro.enable_validation()
     from jax.config import config
 
-    config.update('jax_disable_jit', True)
+    #config.update('jax_disable_jit', True)
     parser = argparse.ArgumentParser(description="Non-centered reparameterization example")
     parser.add_argument("-n", "--num-samples", nargs="?", default=10000, type=int)
     parser.add_argument("--num-warmup", nargs='?', default=5000, type=int)
