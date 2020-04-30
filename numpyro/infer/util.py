@@ -164,6 +164,7 @@ def potential_energy(model, inv_transforms, model_args, model_kwargs, params):
     return - log_joint
 
 
+
 def transformed_potential_energy(potential_energy, inv_transform, z):
     """
     Given a potential energy `p(x)`, compute potential energy of `p(z)`

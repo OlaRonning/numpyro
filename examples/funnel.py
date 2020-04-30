@@ -40,7 +40,7 @@ from numpyro.distributions.transforms import AffineTransform
 from numpyro.infer import MCMC, NUTS, SA, NMC, HMC
 
 
-def model(dim=10):
+def model(dim=2):
     y = numpyro.sample('y', dist.Normal(0, 3))
     numpyro.sample('x', dist.Normal(np.zeros(dim - 1), np.exp(y / 2)))
 
@@ -54,7 +54,8 @@ def reparam_model(dim=10):
 def run_inference(model, args, rng_key):
     kernel = NMC(model)
     mcmc = MCMC(kernel, args.num_warmup, args.num_samples, num_chains=args.num_chains,
-                progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
+                progress_bar=False)
+                #progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
     mcmc.run(rng_key)
     mcmc.print_summary()
     return mcmc.get_samples()
@@ -91,10 +92,10 @@ if __name__ == "__main__":
     numpyro.enable_validation()
     from jax.config import config
 
-    #config.update('jax_disable_jit', True)
+    config.update('jax_disable_jit', True)
     parser = argparse.ArgumentParser(description="Non-centered reparameterization example")
     parser.add_argument("-n", "--num-samples", nargs="?", default=10000, type=int)
-    parser.add_argument("--num-warmup", nargs='?', default=0, type=int)
+    parser.add_argument("--num-warmup", nargs='?', default=5000, type=int)
     parser.add_argument("--num-chains", nargs='?', default=1, type=int)
     parser.add_argument("--device", default='cpu', type=str, help='use "cpu" or "gpu".')
     args = parser.parse_args()

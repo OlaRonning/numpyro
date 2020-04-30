@@ -8,7 +8,7 @@ import math
 from operator import attrgetter
 import os
 import warnings
-import pandas as pd
+from copy import copy
 
 from jax import jit, lax, partial, pmap, random, vmap, device_get, device_put
 from jax import jacfwd, jacrev
@@ -25,6 +25,7 @@ from jax.tree_util import tree_flatten, tree_map, tree_multimap, tree_unflatten
 from numpyro.diagnostics import print_summary
 import numpyro.distributions as dist
 from numpyro.distributions.util import categorical_logits, cholesky_update
+from numpyro.handlers import seed, block, trace, substitute
 
 from numpyro.infer.hmc_util import (
     IntegratorState,
@@ -34,7 +35,7 @@ from numpyro.infer.hmc_util import (
     velocity_verlet,
     warmup_adapter
 )
-from numpyro.infer.util import init_to_uniform, get_potential_fn, find_valid_initial_params
+from numpyro.infer.util import init_to_uniform, get_potential_fn, find_valid_initial_params, log_density
 from numpyro.util import cond, copy_docs_from, fori_collect, fori_loop, identity, not_jax_tracer, cached_by
 
 HMCState = namedtuple('HMCState', ['i', 'z', 'z_grad', 'potential_energy', 'energy', 'num_steps', 'accept_prob',
@@ -945,7 +946,7 @@ class SA(MCMCKernel):
         return self._sample_fn(state, model_args, model_kwargs)
 
 
-NMCState = namedtuple('NMCState', ['i', 'z', 'potential_energy', 'accept_prob', 'diverging',
+NMCState = namedtuple('NMCState', ['i', 'z', 'potential_energies', 'accept_prob', 'diverging',
                                    'mean_accept_prob', 'rng_key'])
 NMCAdaptState = namedtuple('NMCAdaptState', ['loc', 'variance'])
 # TODO: add adapt state to compute p(z_{+1}|z), p(z|z_{+1})
@@ -953,7 +954,7 @@ NMCAdaptState = namedtuple('NMCAdaptState', ['loc', 'variance'])
 """
 
 
-def _nmc(potential_fn=None, potential_fn_gen=None):
+def _nmc(model):
     wa_steps = None
     max_delta_energy = 1000.
 
@@ -975,17 +976,22 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
 
         nonlocal wa_steps
         wa_steps = num_warmup
-        pe_fn = potential_fn
-        if potential_fn_gen:
-            if pe_fn is not None:
-                raise ValueError('Only one of `potential_fn` or `potential_fn_gen` must be provided.')
+
+        _, tr = log_density(model, model_args, model_kwargs, init_params)
+        var_names = list(tr.keys())
+        pes = {}
+        last_var = var_names[-1]
+        while(var_names):
+            var_names.pop(-1)
+            pe, _ = log_density(block(model, lambda site: site['name'] in var_names), model_args, model_kwargs,
+                                    init_params)
+            if var_names:
+                pes[var_names[-1]] = pe
             else:
-                kwargs = {} if model_kwargs is None else model_kwargs
-                pe_fn = potential_fn_gen(*model_args, **kwargs)
+                pes[last_var] = pe
 
 
-
-        nmc_state = NMCState(0, init_params, pe_fn(init_params), 0., False, 0., rng_key)
+        nmc_state = NMCState(0, init_params, pes, 0., False, 0., rng_key)
         return device_put(nmc_state)
 
     def _get_proposer(estimator):
@@ -1008,7 +1014,7 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         ieig_vals = np.reciprocal(eig_vals)
 
         inv_m = np.dot(eig_vecr, np.dot(np.diag(ieig_vals), ieig_vecr))
-        pd_ieig_vals = np.where(ieig_vals > 0, eig_vals, 1e-8)
+        pd_ieig_vals = np.where(-ieig_vals > 0, -eig_vals, 1e-8)
         pd_inv_m = np.dot(eig_vecr, np.dot(np.diag(pd_ieig_vals), ieig_vecr))
 
         return inv_m, pd_inv_m
@@ -1016,17 +1022,17 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
     def _normal_estimator(rng_key, x, jac_pe, hes_pe):
         ndim = np.ndim(x)
         if ndim == 0:
-            variance = 1 / hes_pe
-            ihes_pd = np.where(hes_pe > 0, variance, 1e-8)
+            ihes_pe = 1 / hes_pe
+            variance = np.where(ihes_pe > 0, ihes_pe, 1e-8)
             dist_ = dist.Normal
         elif ndim == 1:
-            ihes_pd, variance = _pd_inv(hes_pe)
+            ihes_pe, variance = _pd_inv(hes_pe)
             dist_ = dist.MultivariateNormal
         elif ndim == 2:
             n, p = np.shape(x)
-            ihes_pd, variance = _pd_inv(hes_pe.reshape(n * p, n * p))
+            ihes_pe, variance = _pd_inv(hes_pe.reshape(n * p, n * p))
             dist_ = dist.MultivariateNormal
-        loc = x.ravel() - 2*np.dot(ihes_pd, jac_pe.ravel().T)  # 2 * from jacobian
+        loc = x.ravel() - np.dot(ihes_pe, jac_pe.ravel().T)
         sample = dist_(loc, variance).sample(rng_key).reshape(x.shape)
         return sample
 
@@ -1061,38 +1067,41 @@ def _nmc(potential_fn=None, potential_fn_gen=None):
         "TODO: vectorize estimator"
         pass
 
-
-
     def sample_kernel(nmc_state, model_args=(), model_kwargs=None):
-        pe_fn = potential_fn  # aka negative log density!
-        if potential_fn_gen:
-            pe_fn = potential_fn_gen(*model_args, **model_kwargs)
-        rng_key, rng_key_transition, rng_key_zj = random.split(nmc_state.rng_key, 3)
+        pe_fn = partial(log_density, model, model_args, model_kwargs)  # aka negative log density!
+        rng_key, rng_key_z = random.split(nmc_state.rng_key)
         z_old = nmc_state.z
-        _, tree_def = tree_flatten(z_old)
-        pe_old = nmc_state.potential_energy
+        z_trans = copy(z_old)
+        pe_trans = {}
+        tr = trace(substitute(model, z_old)).get_trace()
+        pe_old = nmc_state.potential_energies
+        var_names = list(tr.keys())
+        transition = np.array(True)
+        for j, var in enumerate(tr.keys()):
+            _, tree_def = tree_flatten(z_old)
 
-        jac_zj, hes_zj = _jac_hes(pe_fn, z_old)
+            jac_z, hes_z = _jac_hes(lambda *args,**kwargs:pe_fn(*args, **kwargs)[0], z_trans)
+
+            estimator = 'normal'  # TODO: lookup estimator
+
+            rng_key_comp, rng_key_trans, rng_key_z = random.split(rng_key_z, 3)
+            z_prop = _get_proposer(estimator)(rng_key_z, z_trans[var], jac_z[var], hes_z[var])
+            pe_new, _ = log_density(block(model, lambda site: site['name'] in var_names[j+1:]),
+                                    model_args, model_kwargs, dict(z_trans, **{var: z_prop}))
+
+            pe_new = np.where(np.isnan(pe_new), np.inf, pe_new)
+            delta_pe = pe_new - pe_old[var]
+            accept_prob = np.clip(np.exp(delta_pe), a_max=1)
+            transition = np.logical_and(random.bernoulli(rng_key_trans, accept_prob), transition)
 
 
-        estimator = 'normal'  # TODO: lookup estimator
+            z_trans[var], pe_trans[var] = cond(transition,
+                                               (z_prop, pe_new), lambda args: args,
+                                               (z_old[var], pe_old[var]), lambda args: args)
 
-        z_new = tree_multimap(_get_proposer(estimator),   # TODO: flatten this to use vmap
-                              tree_unflatten(tree_def, random.split(rng_key_zj, len(z_old) if isinstance(z_old, dict) else 1)),
-                              z_old,
-                              jac_zj,
-                              hes_zj)
-        pe_new = pe_fn(z_new)
-
-        pe_new = np.where(np.isnan(pe_new), np.inf, pe_new)
-
-        delta_pe = pe_new - pe_old
-        accept_prob = np.clip(np.exp(-delta_pe), a_max=1)
-
-        transition = random.bernoulli(rng_key_transition, accept_prob)
         z, pe = cond(transition,
-                     (z_new, pe_new), lambda args: args,
-                     (z_old, pe_old), lambda args: args)
+                    (z_trans, pe_trans), lambda args: args,
+                    (z_old, pe_old), lambda args: args)
 
         itr = nmc_state.i + 1
         n = np.where(nmc_state.i < wa_steps, itr, itr - wa_steps)
@@ -1126,17 +1135,9 @@ class NMC(MCMCKernel):
         self._sample_fn = None
 
     def _init_state(self, rng_key, model_args, model_kwargs):
-        if self._model is not None:
-            potential_fn_gen, self._postprocess_fn = get_potential_fn(
-                rng_key,
-                self._model,
-                dynamic_args=True,
-                model_args=model_args,
-                model_kwargs=model_kwargs)
-            # NB: init args is different from HMC
-            self._init_fn, self._sample_fn = _nmc(potential_fn_gen=potential_fn_gen)
-        else:
-            self._init_fn, self._sample_fn = _nmc(potential_fn=self._potential_fn)
+
+        seeded_model = seed(self._model, rng_key if rng_key.ndim == 1 else rng_key[0])
+        self._init_fn, self._sample_fn = _nmc(seeded_model)
 
     @copy_docs_from(MCMCKernel.init)
     def init(self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs={}):
@@ -1183,9 +1184,7 @@ class NMC(MCMCKernel):
 
     @copy_docs_from(MCMCKernel.postprocess_fn)
     def postprocess_fn(self, args, kwargs):
-        if self._postprocess_fn is None:
-            return identity
-        return self._postprocess_fn(*args, **kwargs)
+        return identity
 
     def sample(self, state, model_args, model_kwargs):
         """
