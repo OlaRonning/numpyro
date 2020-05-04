@@ -8,8 +8,9 @@ import math
 from operator import attrgetter
 import os
 import warnings
-from copy import copy
+from random import choice as stdlib_choice
 
+import jax
 from jax import jit, lax, partial, pmap, random, vmap, device_get, device_put
 from jax import jacfwd, jacrev
 from jax.core import Tracer
@@ -20,12 +21,12 @@ from jax.lib import xla_bridge
 import jax.numpy as np
 from jax.random import PRNGKey
 from jax.scipy.special import logsumexp
-from jax.tree_util import tree_flatten, tree_map, tree_multimap, tree_unflatten
+from jax.tree_util import tree_flatten, tree_map, tree_multimap
 
 from numpyro.diagnostics import print_summary
 import numpyro.distributions as dist
 from numpyro.distributions.util import categorical_logits, cholesky_update
-from numpyro.handlers import seed, block, trace, substitute
+from numpyro.handlers import seed, trace, substitute, replay
 
 from numpyro.infer.hmc_util import (
     IntegratorState,
@@ -36,7 +37,7 @@ from numpyro.infer.hmc_util import (
     warmup_adapter
 )
 from numpyro.infer.util import init_to_uniform, get_potential_fn, find_valid_initial_params, log_density
-from numpyro.util import cond, copy_docs_from, fori_collect, fori_loop, identity, not_jax_tracer, cached_by
+from numpyro.util import cond, copy_docs_from, fori_collect, fori_loop, identity, not_jax_tracer, cached_by, while_loop
 
 HMCState = namedtuple('HMCState', ['i', 'z', 'z_grad', 'potential_energy', 'energy', 'num_steps', 'accept_prob',
                                    'mean_accept_prob', 'diverging', 'adapt_state', 'rng_key'])
@@ -946,27 +947,14 @@ class SA(MCMCKernel):
         return self._sample_fn(state, model_args, model_kwargs)
 
 
-NMCState = namedtuple('NMCState', ['i', 'z', 'potential_energies', 'accept_prob', 'diverging',
+NMCState = namedtuple('NMCState', ['i', 'z', 'log_likelihood', 'accept_prob', 'diverging',
                                    'mean_accept_prob', 'rng_key'])
-NMCAdaptState = namedtuple('NMCAdaptState', ['loc', 'variance'])
-# TODO: add adapt state to compute p(z_{+1}|z), p(z|z_{+1})
 """
 """
-
 
 def _nmc(model):
     wa_steps = None
     max_delta_energy = 1000.
-
-    def _jac_hes(pe_fn, x):
-        n = len(x) if isinstance(x, dict) else 0
-        jac_fn = jacfwd(pe_fn)
-        hes_fn = jacrev(jac_fn)
-        jac = jac_fn(x)
-        tree_def = tree_flatten(jac)[1]
-        hes_leaves = tree_flatten(hes_fn(x))[0][::n + 1]  # remove all d/dxdy f leaves
-        hes = tree_unflatten(tree_def, hes_leaves)
-        return jac, hes
 
     def init_kernel(init_params,
                     num_warmup,
@@ -976,37 +964,130 @@ def _nmc(model):
 
         nonlocal wa_steps
         wa_steps = num_warmup
+        tr = trace(substitute(model, init_params)).get_trace(*model_args, **model_kwargs)
+        ll = _log_density_from(tr)
 
-        _, tr = log_density(model, model_args, model_kwargs, init_params)
-        var_names = list(tr.keys())
-        pes = {}
-        last_var = var_names[-1]
-        while(var_names):
-            var_names.pop(-1)
-            pe, _ = log_density(block(model, lambda site: site['name'] in var_names), model_args, model_kwargs,
-                                    init_params)
-            if var_names:
-                pes[var_names[-1]] = pe
-            else:
-                pes[last_var] = pe
+        nmc_state = NMCState(i=0,
+                             z=init_params,
+                             log_likelihood=ll,
+                             accept_prob=0.,
+                             diverging=False,
+                             mean_accept_prob=0.,
+                             rng_key=rng_key)
 
-
-        nmc_state = NMCState(0, init_params, pes, 0., False, 0., rng_key)
         return device_put(nmc_state)
 
-    def _get_proposer(estimator):
-        if estimator == 'normal':
-            sampler = _normal_estimator
-        elif estimator == 'cauchy':
+    def sample_kernel(nmc_state, model_args=(), model_kwargs=None):
+
+        rng_key, rng_key_choose_site, rng_key_sample_site, rng_key_trans = random.split(nmc_state.rng_key, 4)
+
+        params = nmc_state.z
+        site_name = stdlib_choice(list(params.keys()))
+
+        ll_curr = nmc_state.log_likelihood
+
+        tr_curr = trace(substitute(model, params)).get_trace(*model_args, **model_kwargs)
+
+        dist_curr = tr_curr[site_name]['fn']
+        value_curr = tr_curr[site_name]['value']
+
+        ld_fn = lambda args: partial(log_density, model, model_args, model_kwargs)(args)[0]
+        value_prop, dist_prop = _sampler(site_name,
+                                         ld_fn,
+                                         _get_z_from(tr_curr),
+                                         tr_curr[site_name]['fn'],
+                                         rng_key_sample_site)
+
+        ll_pv = dist_prop.log_prob(value_curr).sum()
+        ll_cv = dist_curr.log_prob(value_prop).sum()
+
+        tr_prop = _replay_trace(site_name, tr_curr, dist_prop, value_prop, model_args, model_kwargs)
+        ll_prop = _log_density_from(tr_prop)
+
+        delta_pe = ll_prop - ll_curr + ll_pv - ll_cv
+        accept_prob = np.clip(np.exp(delta_pe), a_max=1)
+        transition = random.bernoulli(rng_key_trans, accept_prob)
+        z, ll = cond(transition,
+                     (_get_z_from(tr_prop), ll_prop), lambda args: args,
+                     (_get_z_from(tr_curr), ll_curr), lambda args: args)
+
+        diverging = delta_pe > max_delta_energy
+
+        itr = nmc_state.i + 1
+        n = np.where(nmc_state.i < wa_steps, itr, itr - wa_steps)
+        mean_accept_prob = nmc_state.mean_accept_prob + (accept_prob - nmc_state.mean_accept_prob) / n
+
+        return NMCState(itr, z, ll, accept_prob, diverging, mean_accept_prob, rng_key)
+
+    def _replay_trace(name, tr, new_dist, new_value, model_args, model_kwargs):
+        fn_curr = tr[name]['fn']
+        value_curr = tr[name]['value']
+
+        tr[name]['fn'] = new_dist
+        tr[name]['value'] = new_value
+
+        replayed_tr = trace(replay(model, tr)).get_trace(*model_args, **model_kwargs)
+
+        tr[name]['fn'] = fn_curr
+        tr[name]['value'] = value_curr
+
+        return replayed_tr
+
+    def _log_density_from(tr):
+        """ copied from log density """
+        log_joint = jax.device_put(0.)
+        for site in tr.values():
+            if site['type'] == 'sample':
+                value = site['value']
+                intermediates = site['intermediates']
+                mask = site['mask']
+                scale = site['scale']
+                # Early exit when all elements are masked
+                if not_jax_tracer(mask) and mask is not None and not np.any(mask):
+                    continue
+                if intermediates:
+                        log_prob = site['fn'].log_prob(value, intermediates)
+                else:
+                    log_prob = site['fn'].log_prob(value)
+
+                # Minor optimizations
+                # XXX: note that this may not work correctly for dynamic masks, provide
+                # explicit jax.DeviceArray for masking.
+                if mask is not None:
+                    if scale is not None:
+                        log_prob = np.where(mask, scale * log_prob, 0.)
+                    else:
+                        log_prob = np.where(mask, log_prob, 0.)
+                else:
+                    if scale is not None:
+                        log_prob = scale * log_prob
+                log_prob = np.sum(log_prob)
+                log_joint = log_joint + log_prob
+        return log_joint
+
+    def _get_z_from(tr):
+        return {name: site['value'] for name, site in tr.items()}
+
+    def _sampler(name, ld_fn, params, dist_fn, rng_key):
+        jac_fn = jacfwd(ld_fn)
+        hes_fn = jacrev(jac_fn)
+        jac = jac_fn(params)[name]
+        hes = hes_fn(params)[name][name]
+        sampler = _get_sampler(dist_fn)
+        value, dist_ = sampler(rng_key, params[name], jac, hes)
+        return value, dist_
+
+    def _get_sampler(dist_):
+        support = dist_.support
+        if isinstance(support, (dist.constraints._Real, dist.constraints._RealVector)):
             # TODO: find way to know to use cauchy
-            sampler = _cauchy_estimator
-        elif estimator == 'half_space':
-            sampler = _half_space_estimator
-        elif estimator == 'simplex':
-            sampler = _simplex_estimator
+            return _normal_estimator
+        elif isinstance(support, dist.constraints._GreaterThan):
+            return _half_space_estimator
+        elif isinstance(support, dist.constraints._Simplex):
+            return _simplex_estimator
         else:
-            sampler = None
-        return sampler
+            return None
 
     def _pd_inv(m):
         eig_vals, eig_vecr = map(np.real, np.linalg.eig(m))
@@ -1014,7 +1095,7 @@ def _nmc(model):
         ieig_vals = np.reciprocal(eig_vals)
 
         inv_m = np.dot(eig_vecr, np.dot(np.diag(ieig_vals), ieig_vecr))
-        pd_ieig_vals = np.where(ieig_vals < 0, -eig_vals, 1e-8)
+        pd_ieig_vals = np.where(ieig_vals < 0, -eig_vals, 1e-3)
         pd_inv_m = np.dot(eig_vecr, np.dot(np.diag(pd_ieig_vals), ieig_vecr))
 
         return inv_m, pd_inv_m
@@ -1023,7 +1104,7 @@ def _nmc(model):
         ndim = np.ndim(x)
         if ndim == 0:
             ihes_pe = 1 / hes_pe
-            variance = np.where(ihes_pe < 0, -ihes_pe, 1e-8)
+            variance = np.where(ihes_pe < 0, -ihes_pe, 1e-3)
             dist_ = dist.Normal
         elif ndim == 1:
             ihes_pe, variance = _pd_inv(hes_pe)
@@ -1033,8 +1114,8 @@ def _nmc(model):
             ihes_pe, variance = _pd_inv(hes_pe.reshape(n * p, n * p))
             dist_ = dist.MultivariateNormal
         loc = x.ravel() - np.dot(ihes_pe, jac_pe.ravel().T)
-        sample = dist_(loc, variance).sample(rng_key).reshape(x.shape)
-        return sample
+        dist_ = dist_(loc, variance)
+        return dist_.sample(rng_key).reshape(x.shape), dist_
 
     def _cauchy_estimator(rng_key, x, jac_pe, hes_pe):
         ndim = np.ndim(x)
@@ -1049,12 +1130,15 @@ def _nmc(model):
             hes_pe = hes_pe.reshape(n * p, n * p)
             jac_pe = jac_pe.ravel().T
             dist_ = dist.continuous.MultivariateCauchy
-        tmp = -hes_pe - np.outer(jac_pe, jac_pe.T)
+
+        tmp = -hes_pe - np.outer(jac_pe, jac_pe.T)  #TODO: rename this variable
         s = np.dot(jac_pe.T, np.dot(inv(hes_pe), jac_pe))
         loc = x.ravel() - np.dot(inv(tmp), jac_pe)
         scale = tmp * (s - 1) / (2 - s)
 
-        return dist_(loc, scale).sample(rng_key).reshape(x.shape)
+        dist_ = dist_(loc, scale)
+
+        return dist_.sample(rng_key).reshape(x.shape), dist_
 
     def _half_space_estimator(rng_key, xj, jac_pe, hes_pe):
 
@@ -1067,48 +1151,6 @@ def _nmc(model):
         "TODO: vectorize estimator"
         pass
 
-    def sample_kernel(nmc_state, model_args=(), model_kwargs=None):
-        pe_fn = partial(log_density, model, model_args, model_kwargs)  # aka negative log density!
-        rng_key, rng_key_z = random.split(nmc_state.rng_key)
-        z_old = nmc_state.z
-        z_trans = copy(z_old)
-        pe_trans = {}
-        tr = trace(substitute(model, z_old)).get_trace()
-        pe_old = nmc_state.potential_energies
-        var_names = list(tr.keys())
-        transition = np.array(True)
-        for j, var in enumerate(tr.keys()):
-            _, tree_def = tree_flatten(z_old)
-
-            jac_z, hes_z = _jac_hes(lambda *args,**kwargs:pe_fn(*args, **kwargs)[0], z_trans)
-
-            estimator = 'normal'  # TODO: lookup estimator
-
-            rng_key_comp, rng_key_trans, rng_key_z = random.split(rng_key_z, 3)
-            z_prop = _get_proposer(estimator)(rng_key_z, z_trans[var], jac_z[var], hes_z[var])
-            pe_new, _ = log_density(block(model, lambda site: site['name'] in var_names[j+1:]),
-                                    model_args, model_kwargs, dict(z_trans, **{var: z_prop}))
-
-            pe_new = np.where(np.isnan(pe_new), np.inf, pe_new)
-            delta_pe = pe_new - pe_old[var]
-            accept_prob = np.clip(np.exp(delta_pe), a_max=1)
-            transition = np.logical_and(random.bernoulli(rng_key_trans, accept_prob), transition)
-
-
-            z_trans[var], pe_trans[var] = cond(transition,
-                                               (z_prop, pe_new), lambda args: args,
-                                               (z_old[var], pe_old[var]), lambda args: args)
-
-        z, pe = cond(transition,
-                    (z_trans, pe_trans), lambda args: args,
-                    (z_old, pe_old), lambda args: args)
-
-        itr = nmc_state.i + 1
-        n = np.where(nmc_state.i < wa_steps, itr, itr - wa_steps)
-        mean_accept_prob = nmc_state.mean_accept_prob + (accept_prob - nmc_state.mean_accept_prob) / n
-
-        diverging = delta_pe > max_delta_energy
-        return NMCState(itr, z, pe, accept_prob, diverging, mean_accept_prob, rng_key)
 
     return init_kernel, sample_kernel
 
@@ -1118,6 +1160,7 @@ class NMC(MCMCKernel):
 
     ***References:***
     1. *Newtonian Monte Carlo: single-site MCMC meets second-order gradient methods* (https://arxiv.org/pdf/2001.05567.pdf)
+    2. *Lightweight Implementations of Probabilistic Programming Languages Via Transformational Compilation* (http://proceedings.mlr.press/v15/wingate11a/wingate11a.pdf)
 
     """
 
@@ -1139,7 +1182,6 @@ class NMC(MCMCKernel):
         seeded_model = seed(self._model, rng_key if rng_key.ndim == 1 else rng_key[0])
         self._init_fn, self._sample_fn = _nmc(seeded_model)
 
-    @copy_docs_from(MCMCKernel.init)
     def init(self, rng_key, num_warmup, init_params=None, model_args=(), model_kwargs={}):
         # non-vectorized
         if rng_key.ndim == 1:
