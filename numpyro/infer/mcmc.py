@@ -8,7 +8,6 @@ import math
 from operator import attrgetter
 import os
 import warnings
-from random import choice as stdlib_choice
 
 import jax
 from jax import jit, lax, partial, pmap, random, vmap, device_get, device_put
@@ -954,7 +953,7 @@ NMCState = namedtuple('NMCState', ['i', 'z', 'log_likelihood', 'accept_prob', 'd
 
 def _nmc(model):
     wa_steps = None
-    max_delta_energy = 1000.
+    max_delta_energy = -1000.
 
     def init_kernel(init_params,
                     num_warmup,
@@ -982,42 +981,44 @@ def _nmc(model):
         rng_key, rng_key_choose_site, rng_key_sample_site, rng_key_trans = random.split(nmc_state.rng_key, 4)
 
         params = nmc_state.z
-        site_name = stdlib_choice(list(params.keys()))
 
-        ll_curr = nmc_state.log_likelihood
+        for site_name in params.keys():
 
-        tr_curr = trace(substitute(model, params)).get_trace(*model_args, **model_kwargs)
+            ll_curr = nmc_state.log_likelihood
 
-        dist_curr = tr_curr[site_name]['fn']
-        value_curr = tr_curr[site_name]['value']
+            tr_curr = trace(substitute(model, params)).get_trace(*model_args, **model_kwargs)
 
-        ld_fn = lambda args: partial(log_density, model, model_args, model_kwargs)(args)[0]
-        value_prop, dist_prop = _sampler(site_name,
-                                         ld_fn,
-                                         _get_z_from(tr_curr),
-                                         tr_curr[site_name]['fn'],
-                                         rng_key_sample_site)
+            dist_curr = tr_curr[site_name]['fn']
+            value_curr = tr_curr[site_name]['value']
 
-        ll_pv = dist_prop.log_prob(value_curr).sum()
-        ll_cv = dist_curr.log_prob(value_prop).sum()
+            ld_fn = lambda args: partial(log_density, model, model_args, model_kwargs)(args)[0]
+            value_prop, dist_prop = _sampler(site_name,
+                                             ld_fn,
+                                             _get_z_from(tr_curr),
+                                             tr_curr[site_name]['fn'],
+                                             rng_key_sample_site)
 
-        tr_prop = _replay_trace(site_name, tr_curr, dist_prop, value_prop, model_args, model_kwargs)
-        ll_prop = _log_density_from(tr_prop)
+            ll_pv = dist_prop.log_prob(value_curr).sum()
+            ll_cv = dist_curr.log_prob(value_prop).sum()
 
-        delta_pe = ll_prop - ll_curr + ll_pv - ll_cv
-        accept_prob = np.clip(np.exp(delta_pe), a_max=1)
-        transition = random.bernoulli(rng_key_trans, accept_prob)
-        z, ll = cond(transition,
-                     (_get_z_from(tr_prop), ll_prop), lambda args: args,
-                     (_get_z_from(tr_curr), ll_curr), lambda args: args)
+            tr_prop = _replay_trace(site_name, tr_curr, dist_prop, value_prop, model_args, model_kwargs)
+            ll_prop = _log_density_from(tr_prop)
 
-        diverging = delta_pe > max_delta_energy
+            delta_pe = ll_prop - ll_curr - ll_cv + ll_pv
+            delta_pe = np.where(np.isnan(delta_pe), np.inf, delta_pe)
+            accept_prob = np.clip(np.exp(delta_pe), a_max=1)
+            transition = random.bernoulli(rng_key_trans, accept_prob)
+            params, ll_curr = cond(transition,
+                                   (_get_z_from(tr_prop), ll_prop), lambda args: args,
+                                   (_get_z_from(tr_curr), ll_curr), lambda args: args)
+
+            diverging = delta_pe < max_delta_energy
 
         itr = nmc_state.i + 1
         n = np.where(nmc_state.i < wa_steps, itr, itr - wa_steps)
         mean_accept_prob = nmc_state.mean_accept_prob + (accept_prob - nmc_state.mean_accept_prob) / n
 
-        return NMCState(itr, z, ll, accept_prob, diverging, mean_accept_prob, rng_key)
+        return NMCState(itr, params, ll_curr, accept_prob, diverging, mean_accept_prob, rng_key)
 
     def _replay_trace(name, tr, new_dist, new_value, model_args, model_kwargs):
         fn_curr = tr[name]['fn']
@@ -1080,7 +1081,6 @@ def _nmc(model):
     def _get_sampler(dist_):
         support = dist_.support
         if isinstance(support, (dist.constraints._Real, dist.constraints._RealVector)):
-            # TODO: find way to know to use cauchy
             return _normal_estimator
         elif isinstance(support, dist.constraints._GreaterThan):
             return _half_space_estimator
@@ -1093,28 +1093,23 @@ def _nmc(model):
         eig_vals, eig_vecr = map(np.real, np.linalg.eig(m))
         ieig_vecr = np.linalg.inv(eig_vecr)
         ieig_vals = np.reciprocal(eig_vals)
-
         inv_m = np.dot(eig_vecr, np.dot(np.diag(ieig_vals), ieig_vecr))
-        pd_ieig_vals = np.where(ieig_vals < 0, -eig_vals, 1e-3)
-        pd_inv_m = np.dot(eig_vecr, np.dot(np.diag(pd_ieig_vals), ieig_vecr))
-
-        return inv_m, pd_inv_m
+        return inv_m
 
     def _normal_estimator(rng_key, x, jac_pe, hes_pe):
         ndim = np.ndim(x)
         if ndim == 0:
             ihes_pe = 1 / hes_pe
-            variance = np.where(ihes_pe < 0, -ihes_pe, 1e-3)
             dist_ = dist.Normal
         elif ndim == 1:
-            ihes_pe, variance = _pd_inv(hes_pe)
+            ihes_pe = _pd_inv(hes_pe)
             dist_ = dist.MultivariateNormal
         elif ndim == 2:
             n, p = np.shape(x)
-            ihes_pe, variance = _pd_inv(hes_pe.reshape(n * p, n * p))
+            ihes_pe = _pd_inv(hes_pe.reshape(n * p, n * p))
             dist_ = dist.MultivariateNormal
         loc = x.ravel() - np.dot(ihes_pe, jac_pe.ravel().T)
-        dist_ = dist_(loc, variance)
+        dist_ = dist_(loc, -ihes_pe)
         return dist_.sample(rng_key).reshape(x.shape), dist_
 
     def _cauchy_estimator(rng_key, x, jac_pe, hes_pe):
@@ -1131,7 +1126,7 @@ def _nmc(model):
             jac_pe = jac_pe.ravel().T
             dist_ = dist.continuous.MultivariateCauchy
 
-        tmp = -hes_pe - np.outer(jac_pe, jac_pe.T)  #TODO: rename this variable
+        tmp = hes_pe - np.outer(jac_pe, jac_pe.T)  #TODO: rename this variable
         s = np.dot(jac_pe.T, np.dot(inv(hes_pe), jac_pe))
         loc = x.ravel() - np.dot(inv(tmp), jac_pe)
         scale = tmp * (s - 1) / (2 - s)
