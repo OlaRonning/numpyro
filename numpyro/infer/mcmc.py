@@ -1135,16 +1135,19 @@ def _nmc(model):
 
         return dist_.sample(rng_key).reshape(x.shape), dist_
 
-    def _half_space_estimator(rng_key, xj, jac_pe, hes_pe):
+    def _half_space_estimator(rng_key, x, jac, hes):
 
-        alpha = 1 - np.dot(xj ** 2, hes_pe ** 2)
-        beta = -np.dot(xj, hes_pe) - jac_pe
+        alpha = 1 - np.dot(x ** 2, hes ** 2)
+        beta = -np.dot(x, hes) - jac
+        dist_ = dist.continuous.Gamma(concentration=alpha, rate=beta)
 
-        return dist.continuous.Gamma(concentration=alpha, rate=beta).sample(rng_key)
+        return dist_.sample(rng_key).reshape(x.shape), dist_
 
-    def _simplex_estimator(x, jac_pe, hes_pe):
-        "TODO: vectorize estimator"
-        pass
+    def _simplex_estimator(rng_key, x, jac, hes):
+
+        concentration = 1 - x**2 * (np.diag(hes) - np.max(hes[~np.eye(hes.shape[0], dtype=bool)].reshape(hes.shape[0], -1), axis=1))
+        dist_ = dist.Dirichlet(concentration=concentration)
+        return dist_.sample(rng_key).reshape(x.shape), dist_
 
 
     return init_kernel, sample_kernel
