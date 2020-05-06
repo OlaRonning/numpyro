@@ -946,10 +946,25 @@ class SA(MCMCKernel):
         return self._sample_fn(state, model_args, model_kwargs)
 
 
-NMCState = namedtuple('NMCState', ['i', 'z', 'log_likelihood', 'accept_prob', 'diverging',
-                                   'mean_accept_prob', 'rng_key'])
+NMCState = namedtuple('NMCState', ['i', 'z', 'log_likelihood', 'accept_prob', 'diverging', 'mean_accept_prob',
+                                   'rng_key'])
 """
+A :func:`~collections.namedtuple` used in Newtonian Monte Carlo.
+This consists of the following fields:
+
+ - **i** - iteration. This is reset to 0 after warmup.
+ - **z** - Python collection representing values (constraint samples from
+   the posterior) at latent sites.
+ - **potential_energy** - Potential energy computed at the given value of ``z``.
+ - **accept_prob** - Acceptance probability of the proposal. Note that ``z``
+   does not correspond to the proposal if it is rejected.
+ - **mean_accept_prob** - Mean acceptance probability until current iteration
+   during warmup or sampling (for diagnostics).
+ - **diverging** - A boolean value to indicate whether the new sample potential energy
+   is diverging from the current one.
+ - **rng_key** - random number generator seed used for the iteration.
 """
+
 
 def _nmc(model):
     wa_steps = None
@@ -1005,7 +1020,7 @@ def _nmc(model):
             ll_prop = _log_density_from(tr_prop)
 
             delta_pe = ll_prop - ll_curr - ll_cv + ll_pv
-            delta_pe = np.where(np.isnan(delta_pe), np.inf, delta_pe)
+            delta_pe = np.where(np.isnan(delta_pe), -np.inf, delta_pe)
             accept_prob = np.clip(np.exp(delta_pe), a_max=1)
             transition = random.bernoulli(rng_key_trans, accept_prob)
             params, ll_curr = cond(transition,
@@ -1155,11 +1170,33 @@ def _nmc(model):
 
 class NMC(MCMCKernel):
     """
+    Newtonian Monte Carlo, a tangent conic (hessian) based sampler.
+    
+    This is a sampler which adapts gradient steps by the inverse hessian. This allows
+    the sampler to adapt to local structure (such as high curvature) without a dampening scheme.
+    
+    We extend [1] to work over matrix variate random variables by simple reshaping. Note that unlike [2] we update 
+    every site one at a time as described in [3], rather than sampling a single site
 
     ***References:***
-    1. *Newtonian Monte Carlo: single-site MCMC meets second-order gradient methods* (https://arxiv.org/pdf/2001.05567.pdf)
-    2. *Lightweight Implementations of Probabilistic Programming Languages Via Transformational Compilation* (http://proceedings.mlr.press/v15/wingate11a/wingate11a.pdf)
+    1. *Newtonian Monte Carlo: single-site MCMC meets second-order gradient methods* 
+        (https://arxiv.org/pdf/2001.05567.pdf)
+    2. *Lightweight Implementations of Probabilistic Programming Languages Via Transformational Compilation*   
+        (http://proceedings.mlr.press/v15/wingate11a/wingate11a.pdf)
+    3. *Handbook of Markov Chain Monte Carlo* (https://www.mcmchandbook.net)
 
+    :param model: Python callable containing Pyro :mod:`~numpyro.primitives`.
+        If model is provided, `potential_fn` will be inferred using the model.
+    :param potential_fn: Python callable that computes the potential energy
+        given input parameters. The input parameters to `potential_fn` can be
+        any python collection type, provided that `init_params` argument to
+        `init_kernel` has the same type.
+    :param int adapt_state_size: The number of points to generate proposal
+        distribution. Defaults to 2 times latent size.
+    :param bool dense_mass:  A flag to decide if mass matrix is dense or
+        diagonal (default to ``dense_mass=True``)
+    :param callable init_strategy: a per-site initialization function.
+        See :ref:`init_strategy` section for available functions.
     """
 
     def __init__(self,
