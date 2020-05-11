@@ -1019,7 +1019,7 @@ def _nmc(model):
             tr_prop = _replay_trace(site_name, tr_curr, dist_prop, value_prop, model_args, model_kwargs)
             ll_prop = _log_density_from(tr_prop)
 
-            delta_pe = ll_prop - ll_curr - ll_cv + ll_pv
+            delta_pe = ll_prop - ll_curr + ll_pv - ll_cv
             delta_pe = np.where(np.isnan(delta_pe), -np.inf, delta_pe)
             accept_prob = np.clip(np.exp(delta_pe), a_max=1)
             transition = random.bernoulli(rng_key_trans, accept_prob)
