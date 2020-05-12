@@ -9,11 +9,48 @@ from numpy.testing import assert_allclose
 import pytest
 
 
-import numpyro.distributions as dist
-from numpyro.infer.nmc_util import ( LimitedMemoryBFGS, ol_bfgs )
-from numpyro.util import control_flow_prims_disabled, fori_loop, optional
+import jax.numpy as np
+from jax import jacfwd
+
+from numpyro.infer.nmc_util import ( LimitedMemoryBFGS, ol_bfgs)
 
 logger = logging.getLogger(__name__)
 
-def test_lbfgs():
-    pass
+
+def rosenbrock_function(a, b):
+    """ Bivariate function with plato at minimum (a,a**2) """
+
+    def f(x):
+        return (a - x[0]) ** 2 + b * (x[1] - (x[0] ** 2)) ** 2
+    return f
+
+
+def test_optimizer_banana_curve():
+    a = 1  # use pytest for different values
+    b = 100
+    m = 20
+
+    x = np.array([2., 2.])
+
+    fn = rosenbrock_function(a, b)
+    optimum = np.array([a, a**2])
+    grad_fn = jacfwd(fn)
+
+    lbfgs = LimitedMemoryBFGS(x, grad_fn(x), m)
+
+    warm_up = True
+
+    while warm_up:
+        x, warm_up = lbfgs.warmup(x, grad_fn(x), 1e-4)
+
+    converged = False
+
+    while not converged:
+        new_x = x - lbfgs.step(x, grad_fn(x))
+        diff = np.abs(fn(new_x) - fn(x))
+        if diff < 1e-6:
+            converged = True
+        x = new_x
+
+    assert_allclose(x, optimum, atol=5e-2)
+
