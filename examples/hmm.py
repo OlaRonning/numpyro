@@ -36,11 +36,11 @@ from scipy.stats import gaussian_kde
 
 from jax import lax, random
 import jax.numpy as np
-from jax.scipy.special import logsumexp
 
 import numpyro
 import numpyro.distributions as dist
 from numpyro.infer import MCMC, NUTS, NMC, SA
+from numpyro.distributions.util import logsumexp
 
 
 def simulate_data(rng_key, num_categories, num_words, num_supervised_data, num_unsupervised_data):
