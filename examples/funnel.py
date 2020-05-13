@@ -94,10 +94,10 @@ if __name__ == "__main__":
     numpyro.enable_validation()
     from jax.config import config
 
-    #config.update('jax_disable_jit', True)
+    # config.update('jax_disable_jit', True)
     parser = argparse.ArgumentParser(description="Non-centered reparameterization example")
-    parser.add_argument("-n", "--num-samples", nargs="?", default=15000, type=int)
-    parser.add_argument("--num-warmup", nargs='?', default=5000, type=int)
+    parser.add_argument("-n", "--num-samples", nargs="?", default=500, type=int)
+    parser.add_argument("--num-warmup", nargs='?', default=100, type=int)
     parser.add_argument("--num-chains", nargs='?', default=1, type=int)
     parser.add_argument("--device", default='cpu', type=str, help='use "cpu" or "gpu".')
     args = parser.parse_args()
