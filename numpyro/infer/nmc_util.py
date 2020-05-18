@@ -1,10 +1,11 @@
 import jax.numpy as np
-from jax.lax import scan, cond
+from jax import ops
+from jax.lax import scan
 
 
 class LimitedMemoryBFGS:
 
-    def __init__(self, init_position, init_grad, history_size=5):
+    def __init__(self, init_position, init_grad, history_size=5, learning_rate=1e-4):
         """ Limited Memory Broyden–Fletcher–Goldfarb–Shanno algorithm as described in [1]
 
         *** Reference ***
@@ -16,72 +17,84 @@ class LimitedMemoryBFGS:
         """
 
         self.history_size = history_size
-        self.position_history = np.expand_dims(init_position, 0)  # p_k+1 - p_k
-        self.gradient_history = np.expand_dims(init_grad, 0)  # grad_k+1 - grad_k
+        self.learning_rate = learning_rate
+
+        self.position_history = np.zeros((self.history_size, init_position.shape[0]))  # p_k+1 - p_k
+        self.gradient_history = np.zeros((self.history_size, init_grad.shape[0]))  # grad_k+1 - grad_k
+        self.current_index = 0
+
+        self._update_history(init_position, init_grad)
 
     def warmup(self, pos, grad, lr):
         # TODO: conjugated gradient descent
 
-        if not np.array_equal(pos,self.position_history[0,:]):
+        if not np.array_equal(pos, self.position_history[0]):
             self._update_history(pos, grad)
 
         pos = pos - lr * grad
 
-        return pos, self.position_history.shape[0] < self.history_size
+        return pos, len(self.position_history) < self.history_size
 
     def step(self, position, gradient):
 
         if position.shape != gradient.shape:
             raise Exception()
 
-        m, = position.shape
+        m = position.shape[0]
         if m != self.gradient_history.shape[1]:
             raise Exception()
         if m != self.position_history.shape[1]:
             raise Exception()
 
-        rhos = self._rho()
+        if self.current_index < self.history_size:
+            # first history_size steps use CGD
+            # TODO: conjugated gradient descent
+            newton_direction = self.learning_rate * gradient
+        else:
+            reorder = (np.arange(self.history_size) + self.current_index) % self.history_size
+            pos_hist = np.array(self.position_history)[reorder, :]
+            grd_hist = np.array(self.gradient_history)[reorder, :]
 
-        q, alphas = scan(LimitedMemoryBFGS._update_q,
-                         gradient,
-                         (self.position_history, self.gradient_history, rhos))
+            rhos = self._rho()
 
-        init_ihes = self._gamma() * np.eye(m)  # initial inverse hessian
-        init_dir = init_ihes @ q  # approximate newton direction
+            q, alphas = scan(LimitedMemoryBFGS._update_q,
+                             gradient,
+                             (pos_hist, grd_hist, rhos))
 
-        newton_direction, _ = scan(LimitedMemoryBFGS._update_approx_newton_dir,
-                                   init_dir,
-                                   (self.position_history[::-1], self.gradient_history[::-1], rhos[::-1], alphas[::-1]))
+            init_ihes = self._gamma() * np.eye(m)  # initial inverse hessian
 
-        self._update_history(position, gradient)
+            init_dir = init_ihes @ q  # approximate newton direction
+
+            newton_direction, _ = scan(LimitedMemoryBFGS._update_approx_newton_dir,
+                                       init_dir,
+                                       (pos_hist[::-1], grd_hist[::-1], rhos[::-1], alphas[::-1]))
+
+        if not np.array_equal(position, self.position_history[(self.current_index - 1) % self.history_size, :]):
+            self._update_history(position, gradient)
 
         return newton_direction
 
     def _update_history(self, pos, grd):
-        pos_hist = self.position_history.tolist()
-        grd_hist = self.gradient_history.tolist()
+        prev_idx = (self.current_index - 1) % self.history_size
+        cur_idx = self.current_index % self.history_size
+        self.current_index += 1
 
-        n = self.position_history.shape[0]
-
-        pos_hist.insert(0, pos - self.position_history[0, :])
-        grd_hist.insert(0, grd - self.gradient_history[0, :])
-
-        if n == self.history_size:
-            pos_hist.pop(-1)
-            grd_hist.pop(-1)
-
-        self.position_history = np.array(pos_hist)
-        self.gradient_history = np.array(grd_hist)
-
-
+        self.position_history = ops.index_update(self.position_history,
+                                                 ops.index[cur_idx, ...],
+                                                 pos - self.position_history[prev_idx, :])
+        self.gradient_history = ops.index_update(self.gradient_history,
+                                                 ops.index[cur_idx, ...],
+                                                 grd - self.gradient_history[prev_idx, :])
 
     def _gamma(self):
-        g = self.gradient_history[0, :]
-        x = self.position_history[0, :]
+        start_idx = self.current_index % self.history_size
+        x = self.position_history[start_idx, :]
+        g = self.gradient_history[start_idx, :]
+
         return x.T @ g / (g.T @ g)
 
     def _rho(self):
-        return np.reciprocal((self.position_history * self.gradient_history).sum(1))
+        return np.reciprocal((np.array(self.position_history) * np.array(self.gradient_history)).sum(1))
 
     @staticmethod
     def _update_q(prev_q, params):
@@ -100,6 +113,7 @@ class LimitedMemoryBFGS:
         new_dir = prev_dir + x * (alpha - beta)
 
         return new_dir, ()
+
 
 def ol_bfgs():
     """ Online Limited-memory Broyden–Fletcher–Goldfarb–Shanno algorithm

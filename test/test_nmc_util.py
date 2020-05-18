@@ -32,21 +32,21 @@ def test_optimizer_banana_curve():
 
     x = np.array([2., 2.])
 
+    from jax.config import config
+
+    config.update('jax_disable_jit', True)
+
     fn = rosenbrock_function(a, b)
     optimum = np.array([a, a**2])
     grad_fn = jacfwd(fn)
 
     lbfgs = LimitedMemoryBFGS(x, grad_fn(x), m)
 
-    warm_up = True
-
-    while warm_up:
-        x, warm_up = lbfgs.warmup(x, grad_fn(x), 1e-4)
-
     converged = False
 
     while not converged:
         new_x = x - lbfgs.step(x, grad_fn(x))
+        print(new_x, fn(new_x))
         diff = np.abs(fn(new_x) - fn(x))
         if diff < 1e-6:
             converged = True
