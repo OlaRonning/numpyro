@@ -28,15 +28,12 @@ def rosenbrock_function(a, b):
 def test_optimizer_banana_curve():
     a = 1  # use pytest for different values
     b = 100
-    m = 20
+    m = 10
 
     x = np.array([2., 2.])
 
-    from jax.config import config
-
-    config.update('jax_disable_jit', True)
-
     fn = rosenbrock_function(a, b)
+
     optimum = np.array([a, a**2])
     grad_fn = jacfwd(fn)
 
@@ -46,7 +43,7 @@ def test_optimizer_banana_curve():
 
     while not converged:
         new_x = x - lbfgs.step(x, grad_fn(x))
-        print(new_x, fn(new_x))
+        assert not np.any(np.isnan(new_x)), new_x
         diff = np.abs(fn(new_x) - fn(x))
         if diff < 1e-6:
             converged = True

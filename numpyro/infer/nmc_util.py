@@ -1,3 +1,5 @@
+from typing import NamedTuple
+
 import jax.numpy as np
 from jax import ops
 from jax.lax import scan
@@ -51,15 +53,15 @@ class LimitedMemoryBFGS:
             # TODO: conjugated gradient descent
             newton_direction = self.learning_rate * gradient
         else:
-            reorder = (np.arange(self.history_size) + self.current_index) % self.history_size
-            pos_hist = np.array(self.position_history)[reorder, :]
-            grd_hist = np.array(self.gradient_history)[reorder, :]
+            curr_order = (np.arange(self.history_size) + self.current_index) % self.history_size
+            reorder = np.arange(self.history_size)
+            reorder.at[curr_order].set(np.arange(self.history_size))
 
-            rhos = self._rho()
+            rhos = self._rho()[reorder]
 
             q, alphas = scan(LimitedMemoryBFGS._update_q,
                              gradient,
-                             (pos_hist, grd_hist, rhos))
+                             (self.position_history[reorder, :], self.gradient_history[reorder, :], rhos))
 
             init_ihes = self._gamma() * np.eye(m)  # initial inverse hessian
 
@@ -67,7 +69,10 @@ class LimitedMemoryBFGS:
 
             newton_direction, _ = scan(LimitedMemoryBFGS._update_approx_newton_dir,
                                        init_dir,
-                                       (pos_hist[::-1], grd_hist[::-1], rhos[::-1], alphas[::-1]))
+                                       (self.position_history[reorder, :][::-1],
+                                        self.gradient_history[reorder, :][::-1],
+                                        rhos[::-1],
+                                        alphas[::-1]))
 
         if not np.array_equal(position, self.position_history[(self.current_index - 1) % self.history_size, :]):
             self._update_history(position, gradient)
@@ -113,6 +118,33 @@ class LimitedMemoryBFGS:
         new_dir = prev_dir + x * (alpha - beta)
 
         return new_dir, ()
+
+
+class LBFGSResults(NamedTuple):
+    # TODO: fix this (copied from https://github.com/google/jax/pull/3101/files)
+    converged: bool  # bool, True if minimization converges
+    failed: bool  # bool, True if line search fails
+    k: int  # The number of iterations of the BFGS update.
+    nfev: int  # The total number of objective evaluations performed.
+    ngev: int  # total number of jacobian evaluations
+    nhev: int  # total number of hessian evaluations
+    x_k: np.ndarray
+    # A tensor containing the last argument value found during the search. If the search converged, then
+    # this value is the argmin of the objective function.
+    f_k: np.ndarray  # A tensor containing the value of the objective
+    # function at the `position`. If the search
+    # converged, then this is the (local) minimum of
+    # the objective function.
+    g_k: np.ndarray  # A tensor containing the gradient of the
+    # objective function at the
+    # `final_position`. If the search converged
+    # the max-norm of this tensor should be
+    # below the tolerance.
+    H_k: np.ndarray  # A tensor containing the inverse of the estimated Hessian.
+
+
+def l_bfgs(func, init_x):
+    pass
 
 
 def ol_bfgs():

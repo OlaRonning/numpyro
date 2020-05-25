@@ -21,6 +21,7 @@ import jax.numpy as np
 from jax.random import PRNGKey
 from jax.scipy.special import logsumexp
 from jax.tree_util import tree_flatten, tree_map, tree_multimap
+from random import choice as stdlib_choice
 
 from numpyro.diagnostics import print_summary
 import numpyro.distributions as dist
@@ -997,37 +998,38 @@ def _nmc(model):
 
         params = nmc_state.z
 
-        for site_name in params.keys():
+        #for site_name in params.keys():
+        site_name = stdlib_choice(list(params.keys()))
 
-            ll_curr = nmc_state.log_likelihood
+        ll_curr = nmc_state.log_likelihood
 
-            tr_curr = trace(substitute(model, params)).get_trace(*model_args, **model_kwargs)
+        tr_curr = trace(substitute(model, params)).get_trace(*model_args, **model_kwargs)
 
-            dist_curr = tr_curr[site_name]['fn']
-            value_curr = tr_curr[site_name]['value']
+        dist_curr = tr_curr[site_name]['fn']
+        value_curr = tr_curr[site_name]['value']
 
-            ld_fn = lambda args: partial(log_density, model, model_args, model_kwargs)(args)[0]
-            value_prop, dist_prop = _sampler(site_name,
-                                             ld_fn,
-                                             _get_z_from(tr_curr),
-                                             tr_curr[site_name]['fn'],
-                                             rng_key_sample_site)
+        ld_fn = lambda args: partial(log_density, model, model_args, model_kwargs)(args)[0]
+        value_prop, dist_prop = _sampler(site_name,
+                                         ld_fn,
+                                         _get_z_from(tr_curr),
+                                         tr_curr[site_name]['fn'],
+                                         rng_key_sample_site)
 
-            ll_pv = dist_prop.log_prob(value_curr).sum()
-            ll_cv = dist_curr.log_prob(value_prop).sum()
+        ll_pv = dist_prop.log_prob(value_curr).sum()
+        ll_cv = dist_curr.log_prob(value_prop).sum()
 
-            tr_prop = _replay_trace(site_name, tr_curr, dist_prop, value_prop, model_args, model_kwargs)
-            ll_prop = _log_density_from(tr_prop)
+        tr_prop = _replay_trace(site_name, tr_curr, dist_prop, value_prop, model_args, model_kwargs)
+        ll_prop = _log_density_from(tr_prop)
 
-            delta_pe = ll_prop - ll_curr + ll_pv - ll_cv
-            delta_pe = np.where(np.isnan(delta_pe), -np.inf, delta_pe)
-            accept_prob = np.clip(np.exp(delta_pe), a_max=1)
-            transition = random.bernoulli(rng_key_trans, accept_prob)
-            params, ll_curr = cond(transition,
-                                   (_get_z_from(tr_prop), ll_prop), lambda args: args,
-                                   (_get_z_from(tr_curr), ll_curr), lambda args: args)
+        delta_pe = ll_prop - ll_curr + ll_pv - ll_cv
+        delta_pe = np.where(np.isnan(delta_pe), -np.inf, delta_pe)
+        accept_prob = np.clip(np.exp(delta_pe), a_max=1)
+        transition = random.bernoulli(rng_key_trans, accept_prob)
+        params, ll_curr = cond(transition,
+                               (_get_z_from(tr_prop), ll_prop), lambda args: args,
+                               (_get_z_from(tr_curr), ll_curr), lambda args: args)
 
-            diverging = delta_pe < max_delta_energy
+        diverging = delta_pe < max_delta_energy
 
         itr = nmc_state.i + 1
         n = np.where(nmc_state.i < wa_steps, itr, itr - wa_steps)

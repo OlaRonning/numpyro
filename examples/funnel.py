@@ -70,7 +70,7 @@ def main(args):
 
     # do inference with non-centered parameterization
     print("\n=========================== Non-centered Parameterization ============================")
-    reparam_samples = run_inference(reparam_model, args, rng_key)
+    #reparam_samples = run_inference(reparam_model, args, rng_key)
 
     # make plots
     fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(8, 8))
@@ -80,9 +80,9 @@ def main(args):
     #ax2.hist(samples['y'], density=True)
     #ax2.set(ylabel='y', title='Funnel samples with centered parameterization')
 
-    ax2.plot(reparam_samples['x'][:, 0], reparam_samples['y'], "go", alpha=0.3)
-    ax2.set(xlim=(-20, 20), ylim=(-9, 9), xlabel='x[0]', ylabel='y',
-            title='Funnel samples with non-centered parameterization')
+    #ax2.plot(reparam_samples['x'][:, 0], reparam_samples['y'], "go", alpha=0.3)
+    #ax2.set(xlim=(-20, 20), ylim=(-9, 9), xlabel='x[0]', ylabel='y',
+    #        title='Funnel samples with non-centered parameterization')
 
     plt.savefig('funnel_plot.pdf')
     plt.tight_layout()
@@ -94,10 +94,10 @@ if __name__ == "__main__":
     numpyro.enable_validation()
     from jax.config import config
 
-    # config.update('jax_disable_jit', True)
+    config.update('jax_disable_jit', True)
     parser = argparse.ArgumentParser(description="Non-centered reparameterization example")
-    parser.add_argument("-n", "--num-samples", nargs="?", default=500, type=int)
-    parser.add_argument("--num-warmup", nargs='?', default=100, type=int)
+    parser.add_argument("-n", "--num-samples", nargs="?", default=15000, type=int)
+    parser.add_argument("--num-warmup", nargs='?', default=0, type=int)
     parser.add_argument("--num-chains", nargs='?', default=1, type=int)
     parser.add_argument("--device", default='cpu', type=str, help='use "cpu" or "gpu".')
     args = parser.parse_args()
